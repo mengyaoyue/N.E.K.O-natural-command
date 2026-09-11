@@ -169,8 +169,10 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 - id 只能包含字母、数字和下划线，不要带空格
 - 涉及打开网页/软件优先使用 type=shell
 - 【重要】严禁编造不存在的协议（例如 bilibili://、qq://、weixin:// 一律不许出现）
-- 打开网页必须写成：start "" https://具体网址
-- 打开软件优先使用系统自带命令（notepad、calc、mspaint、explorer 等）；其他软件写成 start "" "软件名"，例如 start "" "哔哩哔哩"
+- 打开网页必须写成：start "" https://具体网址（必须带 https://）
+- 打开软件优先使用系统自带命令（notepad、calc、mspaint、explorer 等）；其他软件写成 start "" "软件名"，系统会自动在本机查找真实程序
+- 【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径——路径不存在时命令会无声失败
+- 不要写 cmd /c 前缀，直接写 start
 - 不确定真实路径时，宁可只写软件名，也不要编造协议或路径
 - 纯文本回应使用 type=reply，content 不要有多余解释
 """
@@ -301,6 +303,35 @@ _URL_SCHEME_RE = re.compile(r"^(?P<scheme>[^/\s:]+)://")
 _START_RE = re.compile(r'^\s*start\s+(?:"")?\s*(?P<target>.*)$', re.IGNORECASE | re.DOTALL)
 
 _KNOWN_URL_SCHEMES = {"http", "https", "file", "ftp", "ftps", "mailto"}
+
+# start 的无参数开关：解析目标前先剥掉，否则会把 /max 当成应用名去搜。
+_START_NOARG_FLAGS = {
+    "/b", "/i", "/min", "/max", "/normal", "/separate", "/shared", "/wait",
+    "/low", "/abovenormal", "/belownormal",
+}
+# /D <目录> 带一个参数，单独处理。
+
+# cmd 内置命令与常见控制台程序：这些是“要执行的命令”而不是“要打开的应用”，
+# 解析应用名时必须放行，否则 dir / tasklist 这类查询会被误改成 start。
+_CMD_BUILTINS = {
+    "assoc", "call", "cd", "chdir", "cls", "color", "copy", "date", "del",
+    "dpath", "echo", "endlocal", "erase", "exit", "for", "ftype", "goto", "if",
+    "md", "mkdir", "mklink", "move", "path", "pause", "popd", "prompt", "pushd",
+    "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start",
+    "subst", "time", "title", "type", "ver", "verify", "vol",
+    # 常见控制台程序（虽是 exe，但永远不会是“打开应用”的目标）
+    "find", "findstr", "more", "tree", "where", "tasklist", "taskkill", "sc",
+    "net", "netstat", "ping", "ipconfig", "systeminfo", "wmic", "hostname",
+    "whoami", "driverquery", "sfc", "dism", "chkdsk", "reg", "rundll32",
+}
+
+# 疑似域名但不该当域名的文件扩展名（app.exe / 报告.pdf 不该补 https://）
+_DOMAIN_EXT_DENYLIST = (
+    ".exe", ".dll", ".lnk", ".url", ".bat", ".cmd", ".msi", ".appref-ms",
+    ".txt", ".doc", ".docx", ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".mp3",
+    ".mp4", ".avi", ".mkv", ".zip", ".rar", ".7z", ".py", ".js", ".json",
+    ".html", ".htm", ".xml", ".csv", ".xlsx", ".pptx",
+)
 
 _WINDOWS_BUILTINS = {
     "notepad", "calc", "mspaint", "explorer", "cmd", "control", "taskmgr",
@@ -943,6 +974,38 @@ def _resolve_index(shortcuts, app_paths, app_index) -> AppIndex:
     return get_default_index()
 
 
+def _looks_like_domain(token: str) -> bool:
+    """判断一个无协议 token 是否是应当补全 https:// 的网址域名。
+
+    ``www.bilibili.com`` → True；``app.exe`` / ``哔哩哔哩`` / ``127.0.0.1`` → False。
+    """
+    token = (token or "").strip()
+    if not token or " " in token or "://" in token:
+        return False
+    if token.lower().endswith(_DOMAIN_EXT_DENYLIST):
+        return False
+    return re.match(r"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$", token) is not None
+
+
+def _strip_start_flags(raw_target: str) -> str:
+    """剥掉 start 的开关（/max、/min、/D <目录> 等），返回真正的目标部分。
+
+    原样保留目标的引号形态；剥完什么都不剩时返回空串。
+    """
+    tokens = raw_target.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        low = token.lower()
+        if token == '""' or low in _START_NOARG_FLAGS:
+            i += 1
+        elif low == "/d" and i + 1 < len(tokens):
+            i += 2
+        else:
+            break
+    return " ".join(tokens[i:])
+
+
 def resolve_shell_target(
     content: str,
     hint: str = "",
@@ -951,18 +1014,23 @@ def resolve_shell_target(
     protocol_checker=None,
     app_index: Optional["AppIndex"] = None,
 ) -> str:
-    """把 AI 生成的 shell 命令解析成 Windows 真正能执行的目标。
+    """把 AI 生成的 shell 命令解析成 Windows 真正能执行、且**执行后真的有效**的目标。
 
-    核心目标：**尽量不弹出“你的电脑没有可打开此链接的应用”这类系统对话框**。
-    为此处理三类情况：
+    核心目标：**杜绝“命令跑了但什么都没发生”的无效执行**。cmd 的 ``start`` 只搜
+    PATH，也从不向调用方报错（fire-and-forget 看不到失败），所以必须在执行前把
+    目标验证成确定可用的形态。为此处理五类情况：
+
     1. 伪协议（如 ``start bilibili://``）：协议已在本机注册则原样保留；否则在本机
        应用索引里找真实程序（快捷方式 / Get-StartApps / 注册表 / 安装目录），
        找不到就返回空串，由上层给友好提示；
-    2. 网页地址：补全为 ``start "" <url>``，避免被当成可执行文件路径；
-    3. 纯软件名：先看 PATH，再到本机应用索引里找；找不到同样返回空串。
-
-    解析依赖的 :class:`AppIndex` 在**运行时**采集“当前这台机器”的应用，代码里不含
-    任何写死的本机路径，因此换一个用户 / 电脑也能自动适配。
+    2. 网页地址：补全为 ``start "" <url>``；漏写协议的域名（``start www.bilibili.com``）
+       自动补全 ``https://``，避免被当成软件名去找而无声失败；
+    3. 文件路径目标：**先验证存在**——不存在的 ``.lnk``/``.exe`` 路径是无声失败的
+       最大来源，存在性校验失败时回退到应用索引按名称找真实程序，仍找不到返回空串；
+    4. 裸软件名：先看 PATH，再到本机应用索引里找；同样找不到返回空串；
+    5. 不带 ``start`` 的裸应用名 / 裸协议 / 裸域名（AI 常见的偷懒写法）：按同样的
+       规则解析并改写成 ``start`` 形态；cmd 内置命令（dir / tasklist 等）与带参数的
+       查询命令一律放行，绝不被误改。
 
     ``shortcuts`` / ``app_paths`` / ``protocol_checker`` / ``app_index`` 均可注入，
     便于测试时避开真实文件系统与注册表。
@@ -975,14 +1043,44 @@ def resolve_shell_target(
     if match is None:
         if _URL_SCHEME_RE.match(raw) and raw.lower().startswith(("http://", "https://")):
             return f'start "" "{raw}"'
+        # 只处理“整条命令就是一个 token”的情况；带参数/空格的是查询命令，绝不碰
+        if not raw or re.search(r"\s", raw):
+            return content
+        scheme_match = _URL_SCHEME_RE.match(raw)
+        if scheme_match:
+            scheme = scheme_match.group("scheme").lower()
+            if scheme in _KNOWN_URL_SCHEMES:
+                return f'start "" "{raw}"'
+            checker = protocol_checker if protocol_checker is not None else _is_registered_protocol
+            if checker(scheme):
+                return f'start "" "{raw}"'
+            index = _resolve_index(shortcuts, app_paths, app_index)
+            found = index.find(_alias_candidates(scheme, hint, raw))
+            return f'start "" "{found}"' if found else ""
+        if _looks_like_domain(raw):
+            return f'start "" "https://{raw}"'
+        low = raw.lower()
+        if low in _WINDOWS_BUILTINS or low in _CMD_BUILTINS or low.startswith("shell:"):
+            return content
+        if shutil.which(raw):
+            return content
+        index = _resolve_index(shortcuts, app_paths, app_index)
+        found = index.find(_alias_candidates("", hint, raw))
+        if found:
+            return f'start "" "{found}"'
+        if low.endswith((".exe",) + _LAUNCHER_EXTENSIONS) or "\\" in raw or "/" in raw:
+            # 明确指向本机文件但既不在 PATH 也找不到同名应用 → 必然失败，提前拦截
+            return ""
         return content
 
-    raw_target = match.group("target").strip()
-    target = raw_target.strip('"').strip()
+    target = _strip_start_flags(match.group("target")).strip()
     if not target:
         return content
+    bare_target = target.strip('"').strip()
+    if not bare_target:
+        return content
 
-    scheme_match = _URL_SCHEME_RE.match(target)
+    scheme_match = _URL_SCHEME_RE.match(bare_target)
     scheme = scheme_match.group("scheme").lower() if scheme_match else ""
 
     if scheme and scheme not in _KNOWN_URL_SCHEMES:
@@ -990,35 +1088,50 @@ def resolve_shell_target(
         if checker(scheme):
             return content
         index = _resolve_index(shortcuts, app_paths, app_index)
-        candidates = _alias_candidates(scheme, hint, target)
+        candidates = _alias_candidates(scheme, hint, bare_target)
         found = index.find(candidates)
         if found:
             return f'start "" "{found}"'
         return ""
 
     if scheme in {"http", "https", "file", "ftp", "ftps"}:
-        if raw_target.startswith('"'):
+        if target.startswith('"'):
             return content
-        return f'start "" "{target}"'
+        return f'start "" "{bare_target}"'
 
-    if (
-        not scheme
-        and "\\" not in target
-        and "/" not in target
-        and ":" not in target
-        and not target.lower().endswith(".exe")
-        and target.lower() not in _WINDOWS_BUILTINS
-    ):
-        if shutil.which(target):
+    if not scheme and _looks_like_domain(bare_target):
+        return f'start "" "https://{bare_target}"'
+
+    low_t = bare_target.lower()
+    if low_t in _WINDOWS_BUILTINS or low_t in _CMD_BUILTINS or low_t.startswith("shell:"):
+        return content
+
+    path_like = (
+        "\\" in bare_target
+        or "/" in bare_target
+        or re.match(r"^[A-Za-z]:", bare_target) is not None
+        or low_t.endswith(_LAUNCHER_EXTENSIONS)
+        or low_t.endswith(".exe")
+    )
+    index = _resolve_index(shortcuts, app_paths, app_index)
+
+    if path_like:
+        # 存在性校验：.exe 允许在 PATH 上，其余必须是本机真实文件
+        if shutil.which(bare_target) or os.path.exists(bare_target):
             return content
-        index = _resolve_index(shortcuts, app_paths, app_index)
-        candidates = _alias_candidates("", hint, target)
+        candidates = _alias_candidates("", hint, bare_target)
         found = index.find(candidates)
         if found:
             return f'start "" "{found}"'
         return ""
 
-    return content
+    if shutil.which(bare_target):
+        return content
+    candidates = _alias_candidates("", hint, bare_target)
+    found = index.find(candidates)
+    if found:
+        return f'start "" "{found}"'
+    return ""
 
 
 def _base_name(token: str) -> str:
@@ -1353,13 +1466,15 @@ class CommandRegistry:
             hint = f"{cmd.get('name', '')} {cmd.get('description', '')}".strip()
             resolved = resolve_shell_target(content, hint=hint, app_index=self.app_index)
             if content and resolved == "":
+                target_desc = hint or content
                 return {
                     "success": False,
                     "output": (
-                        f"我在这台电脑上没找到「{hint or content}」对应的应用或快捷方式"
-                        "（已搜索开始菜单、商店应用、注册表和常见安装目录）。"
-                        "你可以换个更准确的应用名，"
+                        f"命令未执行：我在这台电脑上没找到「{target_desc}」对应的真实应用或快捷方式"
+                        f"（原始命令：{content}；已搜索开始菜单、商店应用、注册表和常见安装目录）。"
+                        "请换个更准确的应用名，"
                         '或改用网页版（把命令内容改成 start "" https://具体网址）。'
+                        "确定可用前不要报告成功。"
                     ),
                 }
             try:
@@ -1456,5 +1571,7 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 - 若用户输入明显是新建命令意图（如"帮我加个命令"），优先 create
 - id 只能包含字母、数字和下划线，不要带空格
 - content 不要有多余解释，reply 就是发给用户的文本，shell 就是完整命令行
-- 【重要】shell 命令严禁编造 xxx:// 协议；打开网页用 start "" https://具体网址；打开软件用系统命令或 start "" "软件名"
+- 【重要】shell 命令严禁编造 xxx:// 协议；打开网页用 start "" https://具体网址（必须带 https://）
+- 打开软件写 start "" "软件名"，系统会自动在本机查找真实程序；【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径，路径不存在时会无声失败
+- 不要写 cmd /c 前缀，直接写 start；查询类需求用完整命令行（如 powershell -Command "Get-Date"）
 """
