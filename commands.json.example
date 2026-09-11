@@ -1,0 +1,20 @@
+{
+  "greeting": {
+    "id": "greeting",
+    "name": "问候",
+    "description": "向主人问好",
+    "risk": "harmless",
+    "permission": "user",
+    "type": "reply",
+    "content": "你好喵～今天也要开心呀！"
+  },
+  "open_notepad": {
+    "id": "open_notepad",
+    "name": "打开记事本",
+    "description": "启动系统记事本",
+    "risk": "harmless",
+    "permission": "user",
+    "type": "shell",
+    "content": "notepad"
+  }
+}

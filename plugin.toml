@@ -1,0 +1,42 @@
+[plugin]
+name = "自然语言命令"
+description = "说人话就能指挥电脑喵～ 用 /自然语言 触发动作：AI 先在命令库里语义匹配，命中即执行；没命中就当场自学会，自动生成新命令并长期保存，越用越顺手。支持文本回复与 shell 系统命令，内置无害 / 无法判定 / 有害三档 AI 安全审查——查内存、开软件等无害操作随叫随到，只有可能危害设备的命令才需要 /su 提权。"
+short_description = "Talk to your PC: /natural language commands are AI-matched, auto-created, and safety-audited in three tiers."
+keywords = ["命令", "command", "自然语言", "natural", "自定义", "custom", "路由", "router", "AI", "动态", "dynamic", "安全审查", "security", "权限", "permission", "自动化", "automation", "コマンド", "自然言語", "명령", "자연어"]
+version = "0.1.0"
+type = "plugin"
+id = "neko_natural_command"
+entry = "plugin.plugins.neko_natural_command:NaturalCommandPlugin"
+
+[plugin.author]
+name = "MENGYAOYUE"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin.i18n]
+default_locale = "zh-CN"
+locales_dir = "i18n"
+
+[plugin_runtime]
+enabled = true
+auto_start = false
+
+[plugin.store]
+enabled = true
+
+[neko_natural_command]
+# 管理员密码（必填）。未设置或为空时，所有需要 admin 权限的入口直接拒绝执行。
+# 切换管理员权限使用 /su <密码>。
+admin_password = "CHANGE_ME"
+# AI 未匹配到命令时是否允许自动创建新命令（含 shell 类型，等于让 AI 自行给主机执行任意命令）
+auto_create = true
+# 启动时是否自动清理本插件命令库里的垃圾脏数据（占位/空壳命令、重复命令、无效/损坏条目）
+auto_clean = true
+# 自动创建的新命令默认权限：user 普通用户可触发 / admin 仅管理员可触发
+default_permission = "user"
+# 自动创建的新命令默认类型：reply 文本回复 / shell 系统命令
+default_type = "reply"
+# AI 匹配调用大模型超时（秒）
+llm_timeout = 20

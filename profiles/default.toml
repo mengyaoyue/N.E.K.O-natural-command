@@ -1,0 +1,10 @@
+[neko_natural_command]
+admin_password = "CHANGE_ME"
+auto_create = true
+default_permission = "user"
+default_type = "reply"
+llm_timeout = 20
+
+[plugin_runtime]
+enabled = true
+auto_start = false
