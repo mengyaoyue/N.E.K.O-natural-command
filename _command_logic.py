@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import locale
 import os
@@ -267,6 +268,8 @@ def load_settings(section: Any) -> dict[str, Any]:
         "default_permission": safe_str(section.get("default_permission"), "user"),
         "default_type": safe_str(section.get("default_type"), "reply"),
         "llm_timeout": safe_float(section.get("llm_timeout"), 20.0),
+        # 0 / 负数意味着"无限等待"，统一钳制到最小 1 秒
+        "shell_timeout": max(1.0, safe_float(section.get("shell_timeout"), 30.0)),
     }
 
 
@@ -312,7 +315,18 @@ _LAUNCH_ONLY_BUILTINS = _WINDOWS_BUILTINS - {"cmd", "powershell"}
 _INTERACTIVE_SHELLS = {"cmd", "powershell", "pwsh", "python", "python3", "py", "node"}
 
 # 会输出结果的 shell 命令最长等待时间（秒），超时即判定失败，避免卡死。
+# 运行时可通过配置项 shell_timeout 覆盖。
 _SHELL_OUTPUT_TIMEOUT = 30
+
+# 回传给 AI 的 shell 输出最多保留多少字符，超出部分截断（防止撑爆上下文）。
+_MAX_SHELL_OUTPUT_CHARS = 4000
+
+# 匹配提示词里最多携带的候选命令条数：本地预筛后只把最相关的一批发给模型，
+# 避免命令库越学越大后把整库 JSON 塞进提示词。
+_MATCH_CANDIDATE_LIMIT = 30
+
+# 合法命令 id：仅字母 / 数字 / 下划线（提示词里对 AI 的要求一致）。
+_COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 # 纯“启动器”类扩展名：双击即打开，不产生可读输出。
 _LAUNCHER_EXTENSIONS = (".lnk", ".url", ".appref-ms")
@@ -1061,6 +1075,101 @@ def _decode_shell_output(data: Any) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _truncate_output(text: str, limit: int = _MAX_SHELL_OUTPUT_CHARS) -> str:
+    """截断过长的命令输出，防止把 AI 上下文撑爆。"""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…（输出过长，已截断，仅保留前 {limit} 字符）"
+
+
+def slugify_command_id(raw: Any, fallback: str = "cmd") -> str:
+    """把任意字符串清洗成合法命令 id（仅字母 / 数字 / 下划线）。
+
+    AI 生成的新命令 id 可能带空格、中文或为空；不清洗就直接落库会写出
+    ``""`` 这类脏键。清洗后若与期望不同，调用方需要再处理重名。
+    """
+    text = safe_str(raw)
+    if _COMMAND_ID_RE.match(text):
+        return text
+    slug = re.sub(r"[^A-Za-z0-9_]+", "_", text).strip("_")
+    if not slug:
+        slug = re.sub(r"[^A-Za-z0-9_]+", "_", safe_str(fallback)).strip("_")
+    return slug or "cmd"
+
+
+def shortlist_commands(
+    commands: dict[str, dict[str, Any]],
+    user_input: str,
+    limit: int = _MATCH_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    """本地预筛与用户输入最相关的候选命令，控制匹配提示词的体积。
+
+    规则（纯本地、确定性，不调用模型）：
+    - 命令数不超过 ``limit`` 时全量返回；
+    - 否则给每条命令打分：输入分词命中命令的 名称/描述/id/内容 越多分越高，
+      名称紧凑匹配（忽略空格与标点）额外加分；
+    - 按分数降序取前 ``limit`` 条；全部零分时按原顺序取前 ``limit`` 条，
+      保证模型仍然看得到一批候选（实在不匹配它会走 create）。
+    """
+    items = list(commands.values())
+    if len(items) <= limit:
+        return items
+
+    compact_input = _compact(user_input)
+    tokens = {
+        token.lower()
+        for token in re.split(r"[^\w\u4e00-\u9fff]+", user_input or "")
+        if len(token) >= 2
+    }
+
+    def score(cmd: dict[str, Any]) -> int:
+        cid = safe_str(cmd.get("id"))
+        name = safe_str(cmd.get("name"))
+        desc = safe_str(cmd.get("description"))
+        content = safe_str(cmd.get("content"))
+        blob = _compact(f"{name} {desc} {cid} {content}")
+        blob_raw = f"{name} {desc} {cid}".lower()
+        points = 0
+        for token in tokens:
+            if _compact(token) in blob or token.lower() in blob_raw:
+                points += 2
+        cname = _compact(name)
+        if compact_input and cname and (cname in compact_input or compact_input in cname):
+            points += 3
+        return points
+
+    ranked = sorted(items, key=score, reverse=True)
+    if score(ranked[0]) == 0:
+        return items[:limit]
+    return ranked[:limit]
+
+
+def format_command_lines(
+    commands: dict[str, dict[str, Any]],
+    keyword: str = "",
+) -> str:
+    """把命令库渲染成给用户看的列表文本；``keyword`` 非空时做模糊过滤。"""
+    key = _compact(keyword)
+    lines = ["📋 已配置命令："]
+    shown = 0
+    for cmd_id, cmd in commands.items():
+        if key:
+            blob = _compact(
+                f"{cmd.get('name', '')} {cmd.get('description', '')} {cmd_id}"
+            )
+            if key not in blob:
+                continue
+        perm = "🔒 admin" if cmd.get("permission") == "admin" else "👤 user"
+        risk = safe_str(cmd.get("risk"))
+        risk_text = f" 风险:{risk}" if risk else ""
+        t = cmd.get("type", "reply")
+        lines.append(f"- {cmd.get('name', cmd_id)} ({cmd_id}) [{t}] {perm}{risk_text}")
+        shown += 1
+    if keyword and not shown:
+        return f"没有匹配「{keyword}」的命令，试试 /cmdlist 查看全部。"
+    return "\n".join(lines)
+
+
 class CommandRegistry:
     """命令注册表：加载、保存、执行、权限校验。"""
 
@@ -1073,6 +1182,7 @@ class CommandRegistry:
         default_permission: str = "user",
         default_type: str = "reply",
         app_index: Optional["AppIndex"] = None,
+        shell_timeout: float = _SHELL_OUTPUT_TIMEOUT,
     ):
         self.commands_path = Path(commands_path)
         self.admin_password = (admin_password or "").strip()
@@ -1081,6 +1191,7 @@ class CommandRegistry:
         self.default_permission = default_permission
         self.default_type = default_type
         self.app_index = app_index
+        self.shell_timeout = max(1.0, float(shell_timeout))
         self.commands: dict[str, dict[str, Any]] = {}
         self._load()
 
@@ -1140,7 +1251,10 @@ class CommandRegistry:
     def switch_permission(self, password: str) -> bool:
         if not self.admin_password_valid:
             return False
-        if password.strip() == self.admin_password:
+        # 常数时间比较，避免通过响应耗时侧信道猜测密码
+        supplied = (password or "").strip().encode("utf-8")
+        expected = self.admin_password.encode("utf-8")
+        if hmac.compare_digest(supplied, expected):
             self.user_permission = "admin"
             return True
         return False
@@ -1176,8 +1290,16 @@ class CommandRegistry:
         return True
 
     def add_command(self, command: dict[str, Any]) -> dict[str, Any]:
-        cmd_id = command.get("id", command.get("name", "cmd"))
-        command.setdefault("id", cmd_id)
+        raw_id = safe_str(command.get("id")) or safe_str(command.get("name"))
+        cmd_id = slugify_command_id(raw_id)
+        if not _COMMAND_ID_RE.match(safe_str(command.get("id"))) and cmd_id in self.commands:
+            # 清洗产生的 id 撞上已有命令时加序号，避免误覆盖别人的配置；
+            # 显式给出的合法 id 保持"同名覆盖=更新"的原语义。
+            base, n = cmd_id, 2
+            while cmd_id in self.commands:
+                cmd_id = f"{base}_{n}"
+                n += 1
+        command["id"] = cmd_id
         command.setdefault("name", cmd_id)
         command.setdefault("description", "")
         command.setdefault("type", self.default_type)
@@ -1256,12 +1378,12 @@ class CommandRegistry:
                     resolved,
                     shell=True,
                     capture_output=True,
-                    timeout=_SHELL_OUTPUT_TIMEOUT,
+                    timeout=self.shell_timeout,
                 )
             except subprocess.TimeoutExpired:
                 return {
                     "success": False,
-                    "output": f"命令执行超时（{_SHELL_OUTPUT_TIMEOUT} 秒）：{cmd.get('name', cmd_id)}",
+                    "output": f"命令执行超时（{int(self.shell_timeout)} 秒）：{cmd.get('name', cmd_id)}",
                 }
             except Exception as exc:
                 return {"success": False, "output": f"执行失败：{exc}"}
@@ -1277,7 +1399,7 @@ class CommandRegistry:
                     "success": True,
                     "output": f"命令已执行，但没有输出：{cmd.get('name', cmd_id)}",
                 }
-            return {"success": True, "output": text}
+            return {"success": True, "output": _truncate_output(text)}
 
         return {"success": False, "output": f"不支持的命令类型：{cmd_type}"}
 
@@ -1297,7 +1419,7 @@ def build_match_prompt(
     """
     return f"""你是自然语言命令路由引擎，同时负责安全审查。
 
-已有命令列表：
+已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分）：
 {json.dumps(commands, ensure_ascii=False, indent=2)}
 
 用户输入：{user_input}

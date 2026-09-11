@@ -19,3 +19,5 @@ default_permission = "user"
 default_type = "reply"
 # AI 匹配调用大模型超时（秒）
 llm_timeout = 20
+# shell 查询类命令最长等待时间（秒），超时判定失败；输出超过 4000 字符自动截断
+shell_timeout = 30

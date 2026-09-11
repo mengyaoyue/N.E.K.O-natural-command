@@ -1,18 +1,28 @@
-"""自然语言命令插件 v0.1（作者：MENGYAOYUE）
+"""自然语言命令插件 v0.2（作者：MENGYAOYUE）
 
 用 /自然语言 触发动作：AI 先在命令库里语义匹配，命中即执行；未命中时自动生成
 新命令写回 commands.json 长期保存，越用越顺手。支持 reply 文本回复与 shell
 系统命令；shell 又区分「打开类」（fire-and-forget）与「查询类」（捕获 stdout
 回传结果）。内置无害 / 无法判定 / 有害三档 AI 安全审查，由风险决定所需权限。
+
+v0.2.0：
+- 零第三方依赖：LLM 调用改用标准库 urllib，不再依赖 httpx；
+- 匹配前先本地预筛候选命令，命令库再大也不会撑爆提示词；
+- shell 查询超时（shell_timeout）可配置，输出超长自动截断；
+- 新增 /helpcmd 与 /findcmd <关键词>；
+- /delcmd 权限门控：删除 admin 级命令需要管理员身份；
+- 命令 id 落库前清洗，杜绝空 id / 带空格 id 的脏数据；
+- 管理员密码改为常数时间比较。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
-
-import httpx
 
 from plugin.sdk.plugin import (
     Err,
@@ -32,11 +42,13 @@ from ._command_logic import (
     build_match_prompt,
     extract_json_object,
     extract_new_command,
+    format_command_lines,
     is_exit_admin,
     load_settings,
     normalize_action,
     parse_user_input,
     safe_str as _safe_str,
+    shortlist_commands,
 )
 
 _PLUGIN_ID = "neko_natural_command"
@@ -52,9 +64,44 @@ _RUN_COMMAND_SCHEMA: dict[str, Any] = {
     "required": ["text"],
 }
 
+_HELP_TEXT = (
+    "📖 自然语言命令速查\n"
+    "- /<任意自然语言>：AI 先在命令库匹配，命中即执行；未命中会自动学一条新命令\n"
+    "- /cmdlist：列出全部命令；/findcmd <关键词>：按关键词筛选命令\n"
+    "- /delcmd <命令ID>：删除命令（admin 级命令需先提权）\n"
+    "- /su <密码>：切换管理员权限；/退出管理员 等同义命令可降权\n"
+    "- /reloadcmd：重新加载命令库\n"
+    "安全：命令分 harmless / indeterminate / harmful 三档，只有 harmful 需要 /su 提权后执行。"
+)
+
 
 def _build_endpoint_candidates(base_url: str, model: str) -> list[str]:
     return build_endpoint_candidates(base_url, model)
+
+
+def _http_post_json(
+    endpoint: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout: float,
+) -> tuple[int, str]:
+    """标准库 POST JSON：返回 ``(状态码, 响应文本)``；网络层错误返回 ``(0, 错误信息)``。
+
+    放在模块顶层便于独立测试；由 ``asyncio.to_thread`` 调度，不阻塞事件循环。
+    """
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        return exc.code, detail or str(exc)
+    except Exception as exc:
+        return 0, str(exc)
 
 
 @neko_plugin
@@ -74,6 +121,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.default_permission: str = "user"
         self.default_type: str = "reply"
         self.llm_timeout: float = 20.0
+        self.shell_timeout: float = 30.0
         self._config_loaded: bool = False
 
         self.registry = CommandRegistry(
@@ -106,11 +154,13 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.default_permission = settings["default_permission"]
         self.default_type = settings["default_type"]
         self.llm_timeout = settings["llm_timeout"]
+        self.shell_timeout = settings["shell_timeout"]
 
         self.registry.admin_password = self.admin_password
         self.registry.auto_create = self.auto_create
         self.registry.default_permission = self.default_permission
         self.registry.default_type = self.default_type
+        self.registry.shell_timeout = self.shell_timeout
         self._config_loaded = True
 
     async def _ensure_config_loaded(self) -> None:
@@ -198,55 +248,55 @@ class NaturalCommandPlugin(NekoPluginBase):
         }
 
         endpoints = _build_endpoint_candidates(base_url, model)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+        }
         last_text = ""
-        async with httpx.AsyncClient(timeout=self.llm_timeout, follow_redirects=True) as client:
-            for endpoint in endpoints:
-                body = payload
-                if ":generateContent" in endpoint:
-                    body = {
-                        "contents": [
-                            {"role": "user", "parts": [{"text": system + "\n" + user}]}
-                        ],
-                    }
-                resp = await client.post(
-                    endpoint,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                        "x-api-key": api_key,
-                    },
-                    json=body,
-                )
-                last_text = resp.text
-                self.logger.info(
-                    "[natural_command] endpoint=%s status=%s body=%s",
-                    endpoint,
-                    resp.status_code,
-                    last_text[:500],
-                )
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        if ":generateContent" in endpoint:
-                            text = data["candidates"][0]["content"]["parts"][0]["text"]
-                        else:
-                            text = data["choices"][0]["message"]["content"]
-                    except (KeyError, IndexError, ValueError):
-                        continue
+        for endpoint in endpoints:
+            body = payload
+            if ":generateContent" in endpoint:
+                body = {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": system + "\n" + user}]}
+                    ],
+                }
+            status, text = await asyncio.to_thread(
+                _http_post_json, endpoint, headers, body, self.llm_timeout
+            )
+            last_text = text
+            self.logger.info(
+                "[natural_command] endpoint=%s status=%s body=%s",
+                endpoint,
+                status,
+                last_text[:500],
+            )
+            if status == 200:
+                try:
+                    data = json.loads(last_text)
+                    if ":generateContent" in endpoint:
+                        text_out = data["candidates"][0]["content"]["parts"][0]["text"]
+                    else:
+                        text_out = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, ValueError):
+                    continue
 
-                    self.logger.info("[natural_command] 模型原始返回：%s", text[:500])
-                    raw_json = extract_json_object(text)
-                    if not raw_json:
-                        continue
-                    try:
-                        return json.loads(raw_json)
-                    except json.JSONDecodeError:
-                        continue
+                self.logger.info("[natural_command] 模型原始返回：%s", text_out[:500])
+                raw_json = extract_json_object(text_out)
+                if not raw_json:
+                    continue
+                try:
+                    return json.loads(raw_json)
+                except json.JSONDecodeError:
+                    continue
         raise SdkError(f"模型返回无法解析为 JSON：{last_text[:200]}")
 
     async def _match_command(self, user_input: str, user_permission: str) -> dict[str, Any]:
+        # 本地预筛：只把与输入最相关的一批候选发给模型，命令库大了也不会撑爆提示词
+        candidates = shortlist_commands(self.registry.commands, user_input)
         prompt = build_match_prompt(
-            commands=list(self.registry.commands.values()),
+            commands=candidates,
             user_input=user_input,
             user_permission=user_permission,
             auto_create=self.auto_create,
@@ -295,24 +345,29 @@ class NaturalCommandPlugin(NekoPluginBase):
         if is_exit_admin(user_input):
             return Ok(self._exit_admin())
 
+        # admin 权限只在带 / 前缀时生效；不带 / 的自然语言一律按 user 级别处理（与 user 同级），
+        # 因此提权不会让普通聊天/自然语言获得管理员能力。
+        allow_admin = had_prefix
+        effective = self.registry.user_permission if allow_admin else "user"
+
         # 内置管理命令走快捷路径
         builtin = user_input.split()[0].lower()
         if builtin == "cmdlist":
             return Ok(self._list_commands())
+        if builtin == "findcmd":
+            rest = user_input[len("findcmd"):].strip()
+            return Ok(self._list_commands(keyword=rest))
+        if builtin == "helpcmd":
+            return Ok(_HELP_TEXT)
         if builtin == "delcmd":
             rest = user_input[len("delcmd"):].strip()
-            return Ok(self._delete_command(rest))
+            return Ok(self._delete_command(rest, permission=effective))
         if builtin == "su":
             rest = user_input[len("su"):].strip()
             return Ok(self._switch_permission(rest))
         if builtin == "reloadcmd":
             self.registry.reload()
             return Ok("已刷新命令配置")
-
-        # admin 权限只在带 / 前缀时生效；不带 / 的自然语言一律按 user 级别处理（与 user 同级），
-        # 因此提权不会让普通聊天/自然语言获得管理员能力。
-        allow_admin = had_prefix
-        effective = self.registry.user_permission if allow_admin else "user"
 
         # AI 语义匹配或自动创建（威胁审查 risk 与匹配/创建并入同一轮，不额外调用模型）
         try:
@@ -383,22 +438,21 @@ class NaturalCommandPlugin(NekoPluginBase):
         return extract_new_command(result)
 
     # ── 内置管理功能 ────────────────────────────────────────────
-    def _list_commands(self) -> str:
+    def _list_commands(self, keyword: str = "") -> str:
         if not self.registry.commands:
             return "暂无命令"
-        lines = ["📋 已配置命令："]
-        for cmd_id, cmd in self.registry.commands.items():
-            perm = "🔒 admin" if cmd.get("permission") == "admin" else "👤 user"
-            risk = _safe_str(cmd.get("risk"))
-            risk_text = f" 风险:{risk}" if risk else ""
-            t = cmd.get("type", "reply")
-            lines.append(f"- {cmd.get('name', cmd_id)} ({cmd_id}) [{t}] {perm}{risk_text}")
-        return "\n".join(lines)
+        return format_command_lines(self.registry.commands, keyword=keyword)
 
-    def _delete_command(self, args: str) -> str:
+    def _delete_command(self, args: str, permission: str = "user") -> str:
         cmd_id = args.strip()
         if not cmd_id:
             return "用法：/delcmd <命令ID>"
+        target = self.registry.commands.get(cmd_id)
+        if target is None:
+            return f"命令不存在：{cmd_id}"
+        # admin 级（harmful）命令的删除本身就在改安全边界，必须管理员来操作
+        if str(target.get("permission", "user")).lower() == "admin" and permission != "admin":
+            return "该命令是 admin 级，删除需要管理员权限：请先 /su <密码> 提权。"
         if self.registry.delete_command(cmd_id):
             return f"已删除命令：{cmd_id}"
         return f"命令不存在：{cmd_id}"
@@ -460,7 +514,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         },
     )
     async def delete_command_entry(self, command_id: str = "", **_):
-        return Ok(self._delete_command(command_id))
+        return Ok(self._delete_command(command_id, permission=self.registry.user_permission))
 
     @plugin_entry(
         id="switch_permission",

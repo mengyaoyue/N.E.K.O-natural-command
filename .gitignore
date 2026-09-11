@@ -1,0 +1,27 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# ── 构建产物 ──
+build/
+dist/
+*.neko-plugin
+
+# ── 测试与缓存（仅本地保留，不入库）──
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── 虚拟环境 ──
+.venv/
+venv/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+.DS_Store
