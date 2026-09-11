@@ -9,26 +9,66 @@
 
 ---
 
-## 一、如何安装（应该放在哪里）
+## 一、如何安装
 
 > ⚠️ 本插件可以执行 shell 系统命令，请只安装可信来源的副本。
 
-### 第一步：获取插件文件
+N.E.K.O 装插件一共有 **三条通道**，本插件支持其中两条。先弄懂它们的关系，再看具体步骤，就不会被 `.neko-plugin-packages` 绕晕。
 
-两种方式任选其一，最终都要保证插件文件夹的名字是 **`neko_natural_command`**：
+| 通道 | 怎么装 | 装完在哪 | `.neko-plugin-packages` 里会有东西吗 |
+|------|--------|----------|--------------------------------------|
+| ① 导入 `.neko-plugin` 包（推荐） | 在「插件管理」里导入 `.neko-plugin` 文件 | `plugins/neko_natural_command/` | **有**：包文件会收进这里存档 |
+| ② 手动放文件夹 | 直接把 `neko_natural_command` 文件夹拷进 `plugins/` | `plugins/neko_natural_command/` | **没有**：这条路既不用包、也不产生包 |
+| ③ 插件市场 | 在插件市场点安装 | `plugins/<插件名>/` | 有（市场下载的 `.neko-plugin`） |
+
+不管走哪一条，**插件最终都落在 `plugins/neko_natural_command/`**；N.E.K.O 运行的是这个文件夹，而不是包文件本身。
+
+### `.neko-plugin-packages` 到底是什么？
+
+它是 N.E.K.O 安装目录下的一个**包仓库 / 存档目录**，只用来存放 `.neko-plugin` 打包文件本身：
+
+```text
+<N.E.K.O 安装目录>/
+├── plugins/                       ← 插件真正运行的地方（三条通道最终都装到这里）
+│   └── neko_natural_command/
+└── .neko-plugin-packages/         ← 只存 .neko-plugin 打包文件（导入源 / 市场下载存档）
+    ├── neko_natural_command.neko-plugin
+    ├── anysearch.neko-plugin
+    └── ...（其他插件的包）
+```
+
+几个要点：
+
+- 它只放**打包文件（.neko-plugin）**，不放解压后的插件；`plugins/` 里才是解压后真正运行的插件。
+- **什么时候会出现文件**：用通道 ① **导入包**、或通道 ③ **从市场安装**时，包会被收进这里；用通道 ② **手动拷文件夹**时，完全不会用到它。
+- 所以：**如果你在 `.neko-plugin-packages` 里没看到本插件，是正常的** —— 说明当初是用「方式 ② 手动拷文件夹」装的，不是包安装。
+- 可以把它理解成「N.E.K.O 的包存档区」。里面的包只是存档，一般删掉也不影响已经装好的插件运行。
+
+> 想确认自己当初是怎么装的？打开安装目录下的 `plugins.lock.json`，看本插件的 `channel` 字段：`manual` = 手动放文件夹，`market` = 市场安装。
+
+### 方式 ①：导入 `.neko-plugin` 包（推荐）
+
+1. 到本仓库的 **Releases** 页面，下载 `neko_natural_command.neko-plugin`。
+2. 打开 N.E.K.O → **插件管理**，找到**导入 / 安装本地包**（导入 `.neko-plugin`）的入口。
+3. 选中刚下载的 `neko_natural_command.neko-plugin`，确认安装。
+4. 装好后，N.E.K.O 会把它**解压到 `plugins/neko_natural_command/`**，同时把包文件收进 `.neko-plugin-packages/` 存档。
+5. 在**插件管理**里启用「自然语言命令」。
+6. **必做：设置管理员密码**（见下一节），否则插件会被安全地禁用。
+
+### 方式 ②：手动放入 `plugins` 目录
+
+1. **关闭 N.E.K.O**，确认插件没有在运行。
+2. 获取插件文件夹（二选一），文件夹名必须是 **`neko_natural_command`**：
 
 ```bash
-# 方式 A：git 克隆（仓库文件夹默认叫 N.E.K.O-natural-command，克隆后请改名）
+# git 克隆（仓库文件夹默认叫 N.E.K.O-natural-command，克隆后请改名）
 git clone https://github.com/mengyaoyue/N.E.K.O-natural-command.git
 ren N.E.K.O-natural-command neko_natural_command
 ```
 
-方式 B：在仓库页面点 **Code → Download ZIP**，解压后把得到的文件夹改名为 `neko_natural_command`。
+或者：在仓库页面点 **Code → Download ZIP**，解压后把得到的文件夹改名为 `neko_natural_command`。
 
-### 第二步：放入 `plugins` 目录
-
-1. **关闭 N.E.K.O**，确认插件没有在运行。
-2. 把**整个 `neko_natural_command` 文件夹**放进 N.E.K.O 安装目录下的 `plugins` 目录里，最终结构如下：
+3. 把**整个 `neko_natural_command` 文件夹**放进 N.E.K.O 安装目录下的 `plugins` 目录里，最终结构如下：
 
 ```
 <N.E.K.O 安装目录>/
@@ -49,6 +89,7 @@ ren N.E.K.O-natural-command neko_natural_command
 
 > 注意层级：是 `plugins/neko_natural_command/...`。
 > **不要把 `neko_natural_command` 里面的文件直接倒进 `plugins/`。**
+> 这条通道**不会**在 `.neko-plugin-packages` 里生成任何文件，这是正常的。
 
 4. 启动 N.E.K.O，在**插件管理**里找到「自然语言命令」，启用它。
 5. **必做：设置管理员密码**（见下一节），否则插件会被安全地禁用。
