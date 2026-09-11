@@ -43,6 +43,7 @@ from ._command_logic import (
     extract_json_object,
     extract_new_command,
     format_command_lines,
+    format_plugin_result,
     is_exit_admin,
     load_settings,
     normalize_action,
@@ -65,13 +66,15 @@ _RUN_COMMAND_SCHEMA: dict[str, Any] = {
 }
 
 _HELP_TEXT = (
-    "📖 自然语言命令速查\n"
+    "📖 自然语言命令速查喵～\n"
     "- /<任意自然语言>：AI 先在命令库匹配，命中即执行；未命中会自动学一条新命令\n"
+    "- 带参数的命令（如「B站搜索 原神」）：搜索词会自动提取，下次任何关键词都能直接用\n"
+    "- 「查一查/搜一下」类需求会调用其他插件的能力（如联网搜索 anysearch）\n"
     "- /cmdlist：列出全部命令；/findcmd <关键词>：按关键词筛选命令\n"
     "- /delcmd <命令ID>：删除命令（admin 级命令需先提权）\n"
     "- /su <密码>：切换管理员权限；/退出管理员 等同义命令可降权\n"
     "- /reloadcmd：重新加载命令库\n"
-    "安全：命令分 harmless / indeterminate / harmful 三档，只有 harmful 需要 /su 提权后执行。"
+    "安全：命令分 harmless / indeterminate / harmful 三档，只有 harmful 需要 /su 提权后执行喵。"
 )
 
 
@@ -385,7 +388,13 @@ class NaturalCommandPlugin(NekoPluginBase):
             cmd_id = _safe_str(result.get("command_id"))
             if not cmd_id:
                 return Err(SdkError("AI 未返回 command_id"))
-            return self._execute_command(cmd_id, risk=result.get("risk"), allow_admin=allow_admin)
+            return await self._execute_command(
+                cmd_id, risk=result.get("risk"), allow_admin=allow_admin,
+                args=result.get("args"),
+            )
+
+        if action == "need_args":
+            return Ok(self._need_args_message(result))
 
         new_cmd = extract_new_command(result)
 
@@ -398,28 +407,95 @@ class NaturalCommandPlugin(NekoPluginBase):
         if not isinstance(new_cmd, dict) or not new_cmd.get("id"):
             return Err(SdkError("未能生成有效的命令配置。"))
 
-        return self._create_and_run(new_cmd, allow_admin=allow_admin)
+        # 创建时模型同时给出本次执行用的参数值（顶层 args）
+        return await self._create_and_run(
+            new_cmd, allow_admin=allow_admin, args=result.get("args") if result else None
+        )
 
-    def _execute_command(self, cmd_id: str, risk: Any = None, allow_admin: bool = True):
+    def _need_args_message(self, result: dict[str, Any]) -> str:
+        """need_args：用模型给的 ask 文案向用户要参数；没有就用缺参列表兜底。"""
+        ask = _safe_str(result.get("ask"))
+        if ask:
+            return ask
+        missing = result.get("missing")
+        if isinstance(missing, list) and missing:
+            return "喵？还差一些信息呢：" + "、".join(str(m) for m in missing) + "。告诉本喵就好～"
+        return "喵？还差一些信息呢，请补充完整再试～"
+
+    async def _execute_command(
+        self,
+        cmd_id: str,
+        risk: Any = None,
+        allow_admin: bool = True,
+        args: Any = None,
+    ):
         effective = self.registry.user_permission if allow_admin else "user"
-        exec_result = self.registry.execute_command(cmd_id, user_permission=effective, risk=risk)
+        exec_result = await self._dispatch_command(cmd_id, effective, risk=risk, args=args)
         if exec_result["success"]:
             return Ok(exec_result["output"])
         return Err(SdkError(exec_result["output"]))
 
-    def _create_and_run(self, new_cmd: dict[str, Any], allow_admin: bool = True):
+    async def _dispatch_command(
+        self,
+        cmd_id: str,
+        effective: str,
+        risk: Any = None,
+        args: Any = None,
+    ) -> dict[str, Any]:
+        """权限预检 + 按类型分发执行，统一返回 {"success","output"} 字典。"""
+        allowed, deny_reason, cmd = self.registry.authorize_command(cmd_id, effective, risk)
+        if not allowed or cmd is None:
+            return {"success": False, "output": deny_reason or f"未找到命令：{cmd_id}"}
+        if str(cmd.get("type", "")).lower() == "plugin":
+            return await self._run_plugin_command(cmd, args)
+        return self.registry.execute_command(cmd_id, user_permission=effective, risk=risk, args=args)
+
+    async def _run_plugin_command(self, cmd: dict[str, Any], args: Any) -> dict[str, Any]:
+        """执行 type=plugin 命令：调用其他 N.E.K.O 插件暴露的入口。"""
+        target = _safe_str(cmd.get("content"))
+        if ":" not in target:
+            return {"success": False, "output": (
+                f"插件命令的 content 应写成 '插件id:入口id'，当前是：{target}。"
+                "请修正这条命令或重新创建。"
+            )}
+        call_args = {
+            k: v for k, v in (args or {}).items()
+            if isinstance(k, str) and isinstance(v, (str, int, float, bool, list, dict))
+        }
+        self.logger.info("[natural_command] 调用插件能力 target=%s args=%s", target, call_args)
+        try:
+            result = await asyncio.wait_for(
+                self.ctx.plugins.call_entry(target, call_args),
+                timeout=self.shell_timeout,
+            )
+        except asyncio.TimeoutError:
+            return {"success": False, "output": f"喵呜…插件能力 [{target}] 响应超时（{int(self.shell_timeout)} 秒）。"}
+        except Exception as exc:
+            self.logger.exception("call_entry 失败 target=%s: %s", target, exc)
+            return {"success": False, "output": (
+                f"调用插件能力 [{target}] 失败：{exc}。"
+                "可能该插件未安装或未启用，可以先 /cmdlist 看看本机有哪些命令。"
+            )}
+        return {"success": True, "output": format_plugin_result(target, result)}
+
+    async def _create_and_run(
+        self,
+        new_cmd: dict[str, Any],
+        allow_admin: bool = True,
+        args: Any = None,
+    ):
         created = self.registry.add_command(new_cmd)
         cmd_id = created.get("id", new_cmd.get("id"))
         effective = self.registry.user_permission if allow_admin else "user"
-        exec_result = self.registry.execute_command(cmd_id, user_permission=effective)
+        exec_result = await self._dispatch_command(cmd_id, effective, args=args)
+        head = (
+            f"✅ 已自动创建命令 [{created.get('name', cmd_id)}]\n"
+            f"描述：{created.get('description', '无')}\n"
+            f"类型：{created.get('type', 'reply')}｜权限：{created.get('permission', 'user')}"
+            f"｜风险：{created.get('risk', '未知')}\n"
+        )
         if exec_result["success"]:
-            return Ok(
-                f"✅ 已自动创建命令 [{created.get('name', cmd_id)}]\n"
-                f"描述：{created.get('description', '无')}\n"
-                f"类型：{created.get('type', 'reply')}｜权限：{created.get('permission', 'user')}"
-                f"｜风险：{created.get('risk', '未知')}\n"
-                f"结果：{exec_result['output']}"
-            )
+            return Ok(f"{head}结果：{exec_result['output']}")
         return Err(SdkError(exec_result["output"]))
 
     async def _generate_new_command(self, user_input: str) -> Optional[dict[str, Any]]:

@@ -30,6 +30,28 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
         "type": "shell",
         "content": "notepad",
     },
+    # 参数化示例：{query} 在执行时由 AI 从用户输入提取填充，
+    # 所以"搜原神""搜新番"任何关键词都能复用同一条命令。
+    "web_search": {
+        "id": "web_search",
+        "name": "联网搜索",
+        "description": "用浏览器搜索任意关键词（参数 query=关键词）",
+        "risk": "harmless",
+        "permission": "user",
+        "type": "shell",
+        "args": [{"name": "query", "description": "要搜索的关键词"}],
+        "content": 'start "" "https://www.bing.com/search?q={query}"',
+    },
+    "bilibili_search": {
+        "id": "bilibili_search",
+        "name": "B站搜索",
+        "description": "打开哔哩哔哩搜索指定关键词（参数 query=关键词）",
+        "risk": "harmless",
+        "permission": "user",
+        "type": "shell",
+        "args": [{"name": "query", "description": "要搜索的关键词"}],
+        "content": 'start "" "https://search.bilibili.com/all?keyword={query}"',
+    },
 }
 
 
@@ -142,21 +164,30 @@ def build_create_prompt(
     安全审查（威胁等级 risk）与命令生成**并入同一轮输出**，因此不需要再额外调用一次
     大模型：模型在给出命令配置的同时，必须顺手判断它有没有危害。
     """
-    return f"""你是自然语言命令生成引擎，同时负责对生成的命令做安全审查。
+    return f"""你是猫娘的命令生成引擎，同时负责对生成的命令做安全审查。你的口吻是猫娘（句尾加"喵"，简短可爱）。
 
 用户输入：{user_input}
 默认类型：{default_type}
 默认权限（仅在完全无法判断 risk 时参考）：{default_permission}
 
-请根据用户意图为它创建一条可复用的命令配置，并严格只返回 JSON，不要任何其他内容、解释或 markdown 代码块：
+请根据用户意图为它创建一条**可复用**的命令配置：意图里有可变部分（搜索词、名字、文件名等）时，把可变部分做成 {{占位符}} 参数，声明在 args 里；本次执行要用的值放在顶层 args 字段。严格只返回 JSON，不要任何其他内容、解释或 markdown 代码块：
 {{"action": "create", "new_command": {{
   "id": "英文唯一标识，仅字母数字下划线",
   "name": "命令名称",
   "description": "功能描述",
   "risk": "harmless/indeterminate/harmful",
-  "type": "reply/shell",
-  "content": "type=reply 时为要回复给用户的文本；type=shell 时为要执行的完整命令行"
-}}}}
+  "type": "reply/shell/plugin",
+  "args": [{{"name": "参数名", "description": "参数说明"}}],
+  "content": "type=reply 时为要回复给用户的猫娘口吻文本；type=shell 时为要执行的完整命令行（可含 {{占位符}}）；type=plugin 时为 插件id:入口id"
+}}, "args": {{"参数名": "本次执行用的值"}}}}
+
+命令类型说明：
+- reply：文本回复（猫娘口吻）
+- shell：本机命令行
+- plugin：调用其他 N.E.K.O 插件的能力。已知可用的有：
+  * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
+  * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
+  不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄）：
 - harmless：无害。只读、打开软件/网页、文本回复、查询信息，不会改动用户设备资料
@@ -174,7 +205,8 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 - 【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径——路径不存在时命令会无声失败
 - 不要写 cmd /c 前缀，直接写 start
 - 不确定真实路径时，宁可只写软件名，也不要编造协议或路径
-- 纯文本回应使用 type=reply，content 不要有多余解释
+- 纯文本回应使用 type=reply，content 用猫娘口吻，不要有多余解释
+- 用户想"打开某网站做某事"（如"B站搜索原神"）时，做成带 {{占位符}} 的可复用命令并本次填好 args
 """
 
 
@@ -396,7 +428,93 @@ _PLACEHOLDER_RE = re.compile(
     r"|不支持(该|这个|此)"
 )
 
-_VALID_COMMAND_TYPES = ("reply", "shell")
+_VALID_COMMAND_TYPES = ("reply", "shell", "plugin")
+
+# 参数化命令：content（reply/shell）里的 {占位符}，执行时由模型从用户输入提取的值填充。
+_ARG_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def command_arg_names(cmd: Any) -> list[str]:
+    """收集一条命令需要的参数名：显式 ``args`` 声明 + content 里的 {占位符}。"""
+    names: list[str] = []
+    declared = cmd.get("args") if isinstance(cmd, dict) else None
+    if isinstance(declared, list):
+        for item in declared:
+            if isinstance(item, dict) and safe_str(item.get("name")):
+                name = safe_str(item.get("name"))
+            elif isinstance(item, str) and item.strip():
+                name = item.strip()
+            else:
+                continue
+            if name not in names:
+                names.append(name)
+    elif isinstance(declared, dict):
+        for name in declared:
+            name = str(name)
+            if name not in names:
+                names.append(name)
+    content = cmd.get("content") if isinstance(cmd, dict) else None
+    if isinstance(content, str):
+        for match in _ARG_TOKEN_RE.finditer(content):
+            if match.group(1) not in names:
+                names.append(match.group(1))
+    return names
+
+
+def sanitize_arg_value(value: Any, for_shell: bool) -> str:
+    """清洗参数值：压平换行；shell 场景去掉双引号防止 breakout。"""
+    text = safe_str(value)
+    text = text.replace("\r", " ").replace("\n", " ").strip()
+    if for_shell:
+        text = text.replace('"', "")
+    return text
+
+
+def render_command_content(cmd: dict[str, Any], args: Any) -> tuple[str, list[str]]:
+    """把命令 content 里的 {占位符} 用 args 渲染掉。
+
+    返回 ``(渲染后的 content, 缺失的参数名列表)``；缺失时占位符原样保留，
+    由上层生成"需要参数"的友好提示。``plugin`` 类型不走渲染（args 直接透传）。
+    """
+    content = cmd.get("content")
+    if not isinstance(content, str):
+        return "", []
+    args_map = args if isinstance(args, dict) else {}
+    for_shell = safe_str(cmd.get("type"), "reply").lower() == "shell"
+    missing: list[str] = []
+
+    def substitute(match: re.Match) -> str:
+        name = match.group(1)
+        if name in args_map and safe_str(args_map[name]):
+            return sanitize_arg_value(args_map[name], for_shell)
+        missing.append(name)
+        return match.group(0)
+
+    return _ARG_TOKEN_RE.sub(substitute, content), missing
+
+
+def format_plugin_result(target: str, result: Any, limit: int = _MAX_SHELL_OUTPUT_CHARS) -> str:
+    """把其他插件 call_entry 的返回值整理成给主 AI / 用户看的文本。"""
+    if isinstance(result, dict):
+        # SDK 的 Ok() 会被宿主解包成 dict；优先取常见的结果字段
+        payload = result
+        for key in ("result", "output", "data", "content", "text", "message"):
+            if key in payload and payload.get(key) not in (None, "", [], {}):
+                payload = payload.get(key)
+                break
+        if isinstance(payload, str):
+            body = payload
+        else:
+            try:
+                body = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+            except Exception:
+                body = str(payload)
+    elif isinstance(result, str):
+        body = result
+    else:
+        body = str(result)
+    body = _truncate_output(body.strip(), limit)
+    return f"喵～已调用插件能力 [{target}]：\n{body}"
 
 
 def _dirty_reason(
@@ -1276,7 +1394,11 @@ def format_command_lines(
         risk = safe_str(cmd.get("risk"))
         risk_text = f" 风险:{risk}" if risk else ""
         t = cmd.get("type", "reply")
-        lines.append(f"- {cmd.get('name', cmd_id)} ({cmd_id}) [{t}] {perm}{risk_text}")
+        arg_names = command_arg_names(cmd)
+        arg_text = f" 参数:{'/'.join(arg_names)}" if arg_names else ""
+        lines.append(
+            f"- {cmd.get('name', cmd_id)} ({cmd_id}) [{t}] {perm}{risk_text}{arg_text}"
+        )
         shown += 1
     if keyword and not shown:
         return f"没有匹配「{keyword}」的命令，试试 /cmdlist 查看全部。"
@@ -1434,14 +1556,18 @@ class CommandRegistry:
             return True
         return False
 
-    def execute_command(
+    def authorize_command(
         self,
         cmd_id: str,
         user_permission: Optional[str] = None,
         risk: Any = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
+        """执行前权限预检（含自动重审降级），返回 ``(是否放行, 拒绝原因, 命令)``。
+
+        ``plugin`` 等无法同步执行的类型也走这里做统一权限判定。
+        """
         if cmd_id not in self.commands:
-            return {"success": False, "output": f"未找到命令：{cmd_id}"}
+            return False, f"呜…命令 {cmd_id} 不在命令库里喵，试试 /cmdlist 看看有哪些。", None
 
         cmd = self.commands[cmd_id]
         stored = str(cmd.get("permission", "user") or "user").lower()
@@ -1454,10 +1580,50 @@ class CommandRegistry:
         else:
             required = stored
         if not self.check_permission(required, user_permission):
-            return {"success": False, "output": "权限不足，需要管理员权限。请先使用 /su 输入密码切换身份。"}
+            return (
+                False,
+                "权限不足喵…这条命令可能危害设备，需要管理员才能执行：请先发送 /su <密码> 提权再来找本喵。",
+                cmd,
+            )
+        return True, None, cmd
+
+    def execute_command(
+        self,
+        cmd_id: str,
+        user_permission: Optional[str] = None,
+        risk: Any = None,
+        args: Any = None,
+    ) -> dict[str, Any]:
+        allowed, deny_reason, cmd = self.authorize_command(cmd_id, user_permission, risk)
+        if not allowed or cmd is None:
+            return {"success": False, "output": deny_reason or f"未找到命令：{cmd_id}"}
 
         cmd_type = cmd.get("type", "reply")
-        content = cmd.get("content", "")
+        if cmd_type == "plugin":
+            # 跨插件调用需要事件循环，由插件层异步执行；这里只做权限与参数提示
+            missing = [n for n in command_arg_names(cmd) if not safe_str((args or {}).get(n) if isinstance(args, dict) else "")]
+            if missing:
+                return {"success": False, "output": f"需要参数：{', '.join(missing)}"}
+            return {"success": False, "output": "__PLUGIN_ASYNC__"}
+
+        content, missing = render_command_content(cmd, args)
+        if missing:
+            specs = cmd.get("args") if isinstance(cmd.get("args"), list) else []
+            desc = {
+                safe_str(item.get("name")): safe_str(item.get("description"))
+                for item in specs
+                if isinstance(item, dict)
+            }
+            detail = "、".join(
+                f"{name}（{desc.get(name) or '这个参数'}）" for name in missing
+            )
+            return {
+                "success": False,
+                "output": (
+                    f"这条命令还差参数喵：{detail}。"
+                    "请把缺少的信息告诉我，我会自动补上再执行～"
+                ),
+            }
 
         if cmd_type == "reply":
             return {"success": True, "output": content}
@@ -1484,9 +1650,9 @@ class CommandRegistry:
                     if resolved != content:
                         return {
                             "success": True,
-                            "output": f"已执行系统命令：{cmd.get('name', cmd_id)}（已自动解析为：{resolved}）",
+                            "output": f"已帮你执行「{cmd.get('name', cmd_id)}」喵～（系统自动解析为：{resolved}）",
                         }
-                    return {"success": True, "output": f"已执行系统命令：{cmd.get('name', cmd_id)}"}
+                    return {"success": True, "output": f"已帮你执行「{cmd.get('name', cmd_id)}」喵～"}
 
                 # 查询类命令：捕获 stdout/stderr，把结果回传给 AI
                 completed = subprocess.run(
@@ -1498,10 +1664,10 @@ class CommandRegistry:
             except subprocess.TimeoutExpired:
                 return {
                     "success": False,
-                    "output": f"命令执行超时（{int(self.shell_timeout)} 秒）：{cmd.get('name', cmd_id)}",
+                    "output": f"喵呜…「{cmd.get('name', cmd_id)}」等了 {int(self.shell_timeout)} 秒还没跑完，先放弃了喵。可以换个更快的做法再试。",
                 }
             except Exception as exc:
-                return {"success": False, "output": f"执行失败：{exc}"}
+                return {"success": False, "output": f"呜…命令执行出错了：{exc}"}
 
             stdout = _decode_shell_output(completed.stdout).strip()
             stderr = _decode_shell_output(completed.stderr).strip()
@@ -1512,7 +1678,7 @@ class CommandRegistry:
             if not text:
                 return {
                     "success": True,
-                    "output": f"命令已执行，但没有输出：{cmd.get('name', cmd_id)}",
+                    "output": f"「{cmd.get('name', cmd_id)}」跑完了，但它什么都没说喵。",
                 }
             return {"success": True, "output": _truncate_output(text)}
 
@@ -1532,9 +1698,9 @@ def build_match_prompt(
     同时要求模型对匹配到的命令做**独立威胁复审**（risk），用于“自动重审降级”：
     一条原本记成 admin 的无害命令，会被 AI 复审为 harmless 并降为 user。
     """
-    return f"""你是自然语言命令路由引擎，同时负责安全审查。
+    return f"""你是自然语言命令路由引擎，同时负责安全审查。你的主人是一只猫娘，说话要带猫娘口吻（句尾加"喵"，简短可爱）。
 
-已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分）：
+已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分；content 里 {{xxx}} 是参数占位符）：
 {json.dumps(commands, ensure_ascii=False, indent=2)}
 
 用户输入：{user_input}
@@ -1545,21 +1711,33 @@ def build_match_prompt(
 
 请严格只返回 JSON，不要任何其他内容、解释或 markdown 代码块。
 
-1. 如果语义匹配到已有命令：
-{{"action": "execute", "command_id": "命令ID", "risk": "harmless/indeterminate/harmful"}}
+1. 如果语义匹配到已有命令（content 含 {{占位符}} 时必须同时给出从用户输入里提取的 args）：
+{{"action": "execute", "command_id": "命令ID", "risk": "harmless/indeterminate/harmful", "args": {{"参数名": "从用户输入提取的值"}}}}
 
-2. 如果未匹配到且允许自动创建，请生成新命令：
+2. 如果匹配到了但用户没给全必需参数：
+{{"action": "need_args", "command_id": "命令ID", "missing": ["参数名"], "ask": "用猫娘口吻向用户要参数的一句话"}}
+
+3. 如果未匹配到且允许自动创建，请生成新命令（意图含可变部分时，把可变部分做成 {{占位符}} 参数，下次就能复用）：
 {{"action": "create", "new_command": {{
   "id": "英文唯一标识",
   "name": "命令名称",
   "description": "功能描述",
   "risk": "harmless/indeterminate/harmful",
-  "type": "reply/shell",
-  "content": "回复文本或要执行的命令"
-}}}}
+  "type": "reply/shell/plugin",
+  "args": [{{"name": "参数名", "description": "参数说明"}}],
+  "content": "回复文本或要执行的命令，可含 {{占位符}}"
+}}, "args": {{"参数名": "本次执行用的值"}}}}
 
-3. 如果未匹配到且不允许创建：
+4. 如果未匹配到且不允许创建：
 {{"action": "not_found"}}
+
+命令类型说明：
+- reply：文本回复（猫娘口吻）
+- shell：本机命令行
+- plugin：调用其他 N.E.K.O 插件的能力，content 写 "插件id:入口id"，args 是传给它的参数。已知可用的有：
+  * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
+  * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
+  不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄命令配置里的 permission）：
 - harmless：无害。只读、打开软件/网页、文本回复、查询信息，不会改动用户设备资料
@@ -1570,8 +1748,9 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 规则：
 - 若用户输入明显是新建命令意图（如"帮我加个命令"），优先 create
 - id 只能包含字母、数字和下划线，不要带空格
-- content 不要有多余解释，reply 就是发给用户的文本，shell 就是完整命令行
+- content 不要有多余解释，reply 就是发给用户的猫娘口吻文本，shell 就是完整命令行
 - 【重要】shell 命令严禁编造 xxx:// 协议；打开网页用 start "" https://具体网址（必须带 https://）
 - 打开软件写 start "" "软件名"，系统会自动在本机查找真实程序；【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径，路径不存在时会无声失败
-- 不要写 cmd /c 前缀，直接写 start；查询类需求用完整命令行（如 powershell -Command "Get-Date"）
+- 不要写 cmd /c 前缀，直接写 start；查询类需求优先 plugin 类型（联网搜索等），其次完整命令行（如 powershell -Command "Get-Date"）
+- 用户想"打开某网站做某事"（如"B站搜索原神"）时，把搜索词做成 {{占位符}} 参数并本次填好 args，这样下次任何关键词都能复用
 """
