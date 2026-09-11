@@ -187,6 +187,9 @@ def build_create_prompt(
 - plugin：调用其他 N.E.K.O 插件的能力。已知可用的有：
   * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
   * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
+  * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
+  * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
+  * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄）：
@@ -1737,6 +1740,9 @@ def build_match_prompt(
 - plugin：调用其他 N.E.K.O 插件的能力，content 写 "插件id:入口id"，args 是传给它的参数。已知可用的有：
   * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
   * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
+  * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
+  * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
+  * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄命令配置里的 permission）：
