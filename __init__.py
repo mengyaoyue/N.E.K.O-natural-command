@@ -203,6 +203,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.deep_search_max_pages = settings["deep_search_max_pages"]
         self.deep_search_progress = settings["deep_search_progress"]
         self._config_loaded = True
+        self._probe_context()
 
         # 插件互联：数据目录 / 平级插件目录在拿到 data_path 后初始化一次
         if self.entry_registry_path is None:
@@ -216,6 +217,57 @@ class NaturalCommandPlugin(NekoPluginBase):
             await self._load_config()
 
     # ── 插件互联（v0.4）────────────────────────────────────────
+    async def _call_entry(self, target: str, args: Optional[dict[str, Any]] = None, timeout: float = 30.0) -> Any:
+        """跨插件调用：兼容本宿主 SDK 的多种 API 形态。
+
+        宿主二进制里实测存在 call_plugin_entry(target_plugin_id, entry_id, payload, timeout)，
+        而部分插件示例用的 ctx.plugins.call_entry("id:entry", args) 在当前版本不存在。
+        按优先级探测，成功一种后不再尝试其它形态。
+        """
+        plugin_id, _, entry_id = target.partition(":")
+        args = args or {}
+        attempts: list[tuple[str, Any]] = []
+        ctx = getattr(self, "ctx", None)
+        if ctx is not None:
+            plugins = getattr(ctx, "plugins", None)
+            if plugins is not None and hasattr(plugins, "call_entry"):
+                attempts.append(("ctx.plugins.call_entry", lambda: plugins.call_entry(target, args)))
+            if hasattr(ctx, "call_plugin_entry"):
+                attempts.append(("ctx.call_plugin_entry", lambda: ctx.call_plugin_entry(plugin_id, entry_id, args, timeout)))
+            bus = getattr(ctx, "bus", None)
+            if bus is not None and hasattr(bus, "call_plugin_entry"):
+                attempts.append(("ctx.bus.call_plugin_entry", lambda: bus.call_plugin_entry(plugin_id, entry_id, args, timeout)))
+        if hasattr(self, "call_plugin_entry"):
+            attempts.append(("self.call_plugin_entry", lambda: self.call_plugin_entry(plugin_id, entry_id, args, timeout)))
+
+        last_error: Optional[Exception] = None
+        for name, call in attempts:
+            try:
+                return await asyncio.wait_for(call(), timeout=timeout)
+            except (AttributeError, TypeError) as exc:
+                last_error = exc
+                self.logger.warning("[natural_command] 跨插件调用形态 %s 不可用: %s", name, exc)
+                continue
+            except asyncio.TimeoutError:
+                raise SdkError(f"插件能力 [{target}] 响应超时（{int(timeout)} 秒）。")
+        raise SdkError(
+            f"跨插件调用不可用喵：当前宿主 SDK 没有可用的调用入口（试过 {len(attempts)} 种形态）。最后错误：{last_error}"
+        )
+
+    def _probe_context(self) -> None:
+        """把 ctx 的真实属性写进日志，便于确认跨插件 API 形态。"""
+        ctx = getattr(self, "ctx", None)
+        if ctx is None:
+            self.logger.warning("[natural_command] ctx 为空，无法探测 SDK 能力")
+            return
+        attrs = [a for a in dir(ctx) if not a.startswith("_")]
+        self.logger.info("[natural_command] ctx(%s) 属性: %s", type(ctx).__name__, ", ".join(attrs[:40]))
+        for name in ("plugins", "bus", "call_plugin_entry"):
+            obj = getattr(ctx, name, None)
+            if obj is not None:
+                self.logger.info("[natural_command] ctx.%s -> %s", name, type(obj).__name__)
+
+    # ── 插件互联占位 ──────────────────────────────────────────
     def _refresh_capabilities(self) -> None:
         """重建能力注册表与已安装插件清单，并渲染成提示词文本块。
 
@@ -574,10 +626,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         }
         self.logger.info("[natural_command] 调用插件能力 target=%s args=%s", target, call_args)
         try:
-            result = await asyncio.wait_for(
-                self.ctx.plugins.call_entry(target, call_args),
-                timeout=self.shell_timeout,
-            )
+            result = await self._call_entry(target, call_args, timeout=self.shell_timeout)
         except asyncio.TimeoutError:
             return {"success": False, "output": f"喵呜…插件能力 [{target}] 响应超时（{int(self.shell_timeout)} 秒）。"}
         except Exception as exc:
@@ -625,8 +674,8 @@ class NaturalCommandPlugin(NekoPluginBase):
     async def _satellite_read(self, url: str) -> str:
         """通过深读卫星插件用真浏览器读取页面（附属插件未装/失败时静默回退）。"""
         try:
-            raw = await self.ctx.plugins.call_entry(
-                "neko_deep_fetch:read_page", {"url": url, "force_browser": True}
+            raw = await self._call_entry(
+                "neko_deep_fetch:read_page", {"url": url, "force_browser": True}, timeout=self.request_timeout
             )
         except Exception as exc:
             self.logger.info("[deep_search] 卫星读页不可用: %s", exc)
@@ -641,8 +690,8 @@ class NaturalCommandPlugin(NekoPluginBase):
     async def _satellite_bing_cards(self, query: str) -> list[dict[str, Any]]:
         """通过深读卫星用真浏览器做 Bing 搜索，返回深搜卡片。"""
         try:
-            raw = await self.ctx.plugins.call_entry(
-                "neko_deep_fetch:bing_search", {"query": query, "max_results": 8}
+            raw = await self._call_entry(
+                "neko_deep_fetch:bing_search", {"query": query, "max_results": 8}, timeout=self.request_timeout
             )
         except Exception as exc:
             self.logger.info("[deep_search] 卫星 Bing 不可用: %s", exc)
@@ -739,7 +788,11 @@ class NaturalCommandPlugin(NekoPluginBase):
         try:
             with urllib.request.urlopen(request, timeout=self.request_timeout) as resp:
                 return resp.status, resp.read()
-        except Exception:
+        except urllib.error.HTTPError as exc:
+            self.logger.warning("[natural_command] B站请求失败 status={} url={}", exc.code, url[:90])
+            return exc.code, b""
+        except Exception as exc:
+            self.logger.warning("[natural_command] B站请求异常: {} url={}", exc, url[:90])
             return 0, b""
 
     def _bili_get_json(self, url: str, cookie: str = "") -> Optional[dict[str, Any]]:
@@ -796,8 +849,8 @@ class NaturalCommandPlugin(NekoPluginBase):
         search_notes: list[str] = []
         cards: list[dict[str, Any]] = []
         try:
-            raw = await self.ctx.plugins.call_entry(
-                "anysearch:search", {"query": query, "max_results": 10}
+            raw = await self._call_entry(
+                "anysearch:search", {"query": query, "max_results": 10}, timeout=self.request_timeout
             )
             search_text = raw.get("result") if isinstance(raw, dict) else str(raw)
             cards = parse_search_cards(search_text or "")
@@ -820,6 +873,14 @@ class NaturalCommandPlugin(NekoPluginBase):
             seen_urls.add(url)
             merged.append(card)
         cards = [{**card, "index": i} for i, card in enumerate(merged, 1)]
+        if not cards:
+            # 常规双源全挂（anysearch 异常 / B站风控）→ 先让卫星用真浏览器 Bing 补一轮
+            try:
+                cards = await self._satellite_bing_cards(query)
+                if cards:
+                    search_notes.append("已切换真浏览器搜索")
+            except Exception as exc:
+                self.logger.warning("[deep_search] 卫星 Bing 补源失败: %s", exc)
         if not cards:
             note_text = f"（{'；'.join(search_notes)}）" if search_notes else ""
             return (
