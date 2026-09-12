@@ -1532,6 +1532,7 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_deep_fetch:web_search", "desc": "联网搜索（卫星自带免 Key：DuckDuckGo → 真浏览器 Bing 兜底），返回按质量排序的候选网页", "args": {"query": "搜索词", "max_results": "可选，默认 8"}},
     {"id": "neko_deep_fetch:read_page", "desc": "深读网页（真浏览器渲染，可读 JS 页/反爬页）", "args": {"url": "网页地址", "force_browser": "可选 true 跳过静态"}},
     {"id": "neko_deep_fetch:bing_search", "desc": "真浏览器 Bing 搜索，返回结果列表", "args": {"query": "搜索词"}},
+    {"id": "neko_voice_input:open_panel", "desc": "打开语音草稿箱面板（说话转文字可编辑后发送）", "args": {}},
 ]
 
 
