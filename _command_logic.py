@@ -30,12 +30,13 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
         "type": "shell",
         "content": "notepad",
     },
-    # 参数化示例：{query} 在执行时由 AI 从用户输入提取填充，
-    # 所以"搜原神""搜新番"任何关键词都能复用同一条命令。
+    # 参数化示例：{query} 在执行时由 AI 从用户输入提取填充。
+    # 注意定位：这两条只是"打开浏览器看搜索页"，**不产生答案**；
+    # 需要答案的问题（兑换码/情报/核对类）应走 deep_search 深搜动作。
     "web_search": {
         "id": "web_search",
-        "name": "联网搜索",
-        "description": "用浏览器搜索任意关键词（参数 query=关键词）",
+        "name": "浏览器打开搜索页",
+        "description": "在浏览器里打开搜索页让用户亲眼看结果（不产生答案；要答案请用深搜）",
         "risk": "harmless",
         "permission": "user",
         "type": "shell",
@@ -44,8 +45,8 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
     },
     "bilibili_search": {
         "id": "bilibili_search",
-        "name": "B站搜索",
-        "description": "打开哔哩哔哩搜索指定关键词（参数 query=关键词）",
+        "name": "浏览器打开B站搜索",
+        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（不产生答案；要答案请用深搜）",
         "risk": "harmless",
         "permission": "user",
         "type": "shell",
@@ -53,6 +54,44 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
         "content": 'start "" "https://search.bilibili.com/all?keyword={query}"',
     },
 }
+
+
+# 内置示例命令的最新文案（v0.5 起明确"打开搜索页≠给答案"）
+BUILTIN_EXAMPLE_META = {
+    "web_search": {
+        "name": "浏览器打开搜索页",
+        "description": "在浏览器里打开搜索页让用户亲眼看结果（不产生答案；要答案请让AI深搜）",
+    },
+    "bilibili_search": {
+        "name": "浏览器打开B站搜索",
+        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（不产生答案；要答案请让AI深搜）",
+    },
+}
+_BUILTIN_EXAMPLE_CONTENTS = {
+    "web_search": 'start "" "https://www.bing.com/search?q={query}"',
+    "bilibili_search": 'start "" "https://search.bilibili.com/all?keyword={query}"',
+}
+
+
+def refresh_builtin_examples(commands: dict[str, dict[str, Any]]) -> list[str]:
+    """启动自愈：把用户命令库里的内置示例命令名称/描述刷到最新文案。
+
+    只处理已知的两个示例 id，且仅当 content 仍是插件原始模板（用户没改过）时
+    才刷新；用户自建的其它命令一概不碰。返回刷新过的 id 列表。
+    """
+    refreshed: list[str] = []
+    for cmd_id, meta in BUILTIN_EXAMPLE_META.items():
+        cmd = commands.get(cmd_id)
+        if not isinstance(cmd, dict):
+            continue
+        if str(cmd.get("content", "")).strip() != _BUILTIN_EXAMPLE_CONTENTS.get(cmd_id, ""):
+            continue  # 用户改过 content，尊重用户版本
+        if cmd.get("name") == meta["name"] and cmd.get("description") == meta["description"]:
+            continue  # 已是最新
+        cmd["name"] = meta["name"]
+        cmd["description"] = meta["description"]
+        refreshed.append(cmd_id)
+    return refreshed
 
 
 def parse_user_input(text: str) -> str:
@@ -306,6 +345,10 @@ def load_settings(section: Any) -> dict[str, Any]:
         "shell_timeout": max(1.0, safe_float(section.get("shell_timeout"), 30.0)),
         # /调用 直调其它插件能力的权限门槛：user（默认）/ admin
         "direct_call_permission": "admin" if safe_str(section.get("direct_call_permission"), "user").lower() == "admin" else "user",
+        # 深搜最多读几个页面（1-6）
+        "deep_search_max_pages": max(1, min(int(safe_float(section.get("deep_search_max_pages"), 4)), 6)),
+        # 深搜开始时是否推送进度提示
+        "deep_search_progress": safe_bool(section.get("deep_search_progress"), True),
     }
 
 
@@ -1913,6 +1956,11 @@ def build_match_prompt(
     """
     return f"""你是自然语言命令路由引擎，同时负责安全审查。你的主人是一只猫娘，说话要带猫娘口吻（句尾加"喵"，简短可爱）。
 
+【意图分流——最高优先级，先判断再匹配】
+- 用户想要"答案/情报/最新消息/兑换码/帮忙找到并核实某事" → 一律选第 5 条 action=deep_search（深搜会替用户翻网页核实并给答案）。【即使命令库里存在 web_search / bilibili_search 这类命令也不要选它们】——它们只会打开浏览器搜索页，不会产生任何答案。
+- 只有用户明确想"亲眼看搜索结果/打开浏览器搜"（如"帮我打开浏览器搜原神"）→ 才执行 web_search / bilibili_search。
+- 其余情况按下面 1-4 匹配/创建。
+
 已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分；content 里 {{xxx}} 是参数占位符）：
 {json.dumps(commands, ensure_ascii=False, indent=2)}
 
@@ -1943,6 +1991,9 @@ def build_match_prompt(
 
 4. 如果未匹配到且不允许创建：
 {{"action": "not_found"}}
+
+5. 如果是需要**进网页核实**的需求（找最新兑换码/限时情报/必须打开页面才能确认的内容）——按顶部意图分流，这类需求的优先级高于执行任何"打开搜索页"命令：
+{{"action": "deep_search", "query": "改写成适合搜索的问句"}}
 
 命令类型说明：
 - reply：文本回复（猫娘口吻）

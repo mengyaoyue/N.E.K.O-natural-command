@@ -23,3 +23,7 @@ llm_timeout = 20
 shell_timeout = 30
 # /调用 直调其它插件能力的权限门槛：user（默认，谁都能直调）/ admin（需先 /su 提权）
 direct_call_permission = "user"
+# 深搜最多读几个页面（1-6）
+deep_search_max_pages = 4
+# 深搜开始时是否推送进度提示
+deep_search_progress = true

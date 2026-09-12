@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -55,10 +56,24 @@ from ._command_logic import (
     normalize_action,
     parse_direct_call_args,
     parse_user_input,
+    refresh_builtin_examples,
     render_entry_list,
     render_plugin_list,
     safe_str as _safe_str,
     shortlist_commands,
+)
+
+from ._deep_search_logic import (
+    build_final_report,
+    build_page_prompt,
+    build_select_prompt,
+    cross_check_codes,
+    decode_page_body,
+    extract_code_candidates,
+    html_to_text,
+    parse_page_analysis,
+    parse_search_cards,
+    parse_selection,
 )
 
 _PLUGIN_ID = "neko_natural_command"
@@ -136,6 +151,8 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.llm_timeout: float = 20.0
         self.shell_timeout: float = 30.0
         self.direct_call_permission: str = "user"
+        self.deep_search_max_pages: int = 4
+        self.deep_search_progress: bool = True
         self._config_loaded: bool = False
 
         # 插件互联（v0.4）：能力注册表 + 已安装插件清单 → 注入匹配提示词
@@ -183,6 +200,8 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.registry.default_type = self.default_type
         self.registry.shell_timeout = self.shell_timeout
         self.direct_call_permission = settings["direct_call_permission"]
+        self.deep_search_max_pages = settings["deep_search_max_pages"]
+        self.deep_search_progress = settings["deep_search_progress"]
         self._config_loaded = True
 
         # 插件互联：数据目录 / 平级插件目录在拿到 data_path 后初始化一次
@@ -239,6 +258,13 @@ class NaturalCommandPlugin(NekoPluginBase):
                 _PLUGIN_ID,
             )
         self._auto_clean_commands()
+        try:
+            healed = refresh_builtin_examples(self.registry.commands)
+            if healed:
+                self.registry._save()
+                self.logger.info("[natural_command] 内置示例命令文案已自愈：%s", ", ".join(healed))
+        except Exception as exc:
+            self.logger.warning("[natural_command] 示例命令自愈失败：%s", exc)
         self.logger.info(
             "[natural_command] 启动，已加载 %d 条命令（admin_password=%s, auto_create=%s, "
             "auto_clean=%s, default_permission=%s, default_type=%s）",
@@ -436,6 +462,15 @@ class NaturalCommandPlugin(NekoPluginBase):
             return Ok(self._plugin_overview())
         if builtin in ("调用", "call"):
             return await self._direct_plugin_call(user_input[len(builtin):].strip(), effective)
+        if builtin in ("深搜", "deepsearch", "deep_search"):
+            query = user_input[len(builtin):].strip()
+            try:
+                return Ok(await self._run_deep_search(query))
+            except SdkError as exc:
+                return Err(exc)
+            except Exception as exc:
+                self.logger.exception("深搜异常: %s", exc)
+                return Err(SdkError(f"深搜出错了喵：{exc}"))
 
         # AI 语义匹配或自动创建（威胁审查 risk 与匹配/创建并入同一轮，不额外调用模型）
         try:
@@ -460,6 +495,16 @@ class NaturalCommandPlugin(NekoPluginBase):
 
         if action == "need_args":
             return Ok(self._need_args_message(result))
+
+        if action == "deep_search":
+            query = _safe_str(result.get("query")) or user_input
+            try:
+                return Ok(await self._run_deep_search(query))
+            except SdkError as exc:
+                return Err(exc)
+            except Exception as exc:
+                self.logger.exception("深搜异常: %s", exc)
+                return Err(SdkError(f"深搜出错了喵：{exc}"))
 
         new_cmd = extract_new_command(result)
 
@@ -542,6 +587,273 @@ class NaturalCommandPlugin(NekoPluginBase):
                 "可能该插件未安装或未启用，可以先 /cmdlist 看看本机有哪些命令。"
             )}
         return {"success": True, "output": format_plugin_result(target, result)}
+
+    # ── 深度搜索代理（v0.5）：搜索 → 筛选 → 进页面 → 核实 → 作答 ──
+    async def _deep_fetch_text(self, url: str) -> str:
+        """抓取网页正文；B站视频页走 API 拿简介+热评（HTML 是 JS 渲染的拿不到）。"""
+        if "bilibili.com/video/" in url or url.startswith("BV"):
+            return await self._bilibili_video_text(url)
+
+        def _get() -> tuple[int, bytes, str]:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": _USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                },
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.request_timeout) as resp:
+                    return resp.status, resp.read(), resp.headers.get("Content-Type", "")
+            except Exception:
+                return 0, b"", ""
+
+        status, body, ctype = await asyncio.to_thread(_get)
+        if status != 200 or not body:
+            return ""
+        return html_to_text(decode_page_body(body, ctype))
+
+    async def _bili_search_cards(self, query: str) -> list[dict[str, Any]]:
+        """B站搜索（匿名）：把视频结果转成深搜卡片（兑换码视频是重要来源）。"""
+        from urllib.parse import quote
+
+        cookie = await self._get_bili_cookie()
+        url = (
+            "https://api.bilibili.com/x/web-interface/search/type"
+            f"?search_type=video&keyword={quote(query)}&page_size=8"
+        )
+        data = await asyncio.to_thread(self._bili_get_json, url, cookie)
+        if not data or data.get("code") != 0:
+            self.logger.warning("[deep_search] B站搜索 code=%s", (data or {}).get("code"))
+            return []
+        cards: list[dict[str, Any]] = []
+        for item in (data.get("data") or {}).get("result") or []:
+            if not isinstance(item, dict) or not item.get("bvid"):
+                continue
+            title = _safe_str(item.get("title"))
+            description = _safe_str(item.get("description"))
+            cards.append({
+                "title": re.sub(r"<[^>]+>", "", title),
+                "url": f"https://www.bilibili.com/video/{item['bvid']}",
+                "desc": re.sub(r"<[^>]+>", "", description)[:200],
+            })
+        return cards
+
+    async def _bilibili_video_text(self, url: str) -> str:
+        """B站视频页：用 view API 拿简介、reply API 拿热评（兑换码常藏在里面）。"""
+        video_id = parse_video_id(url)
+        if not video_id or "bvid" not in video_id:
+            return ""
+        try:
+            info = await self._fetch_bili_video(video_id["bvid"])
+        except Exception:
+            return ""
+        parts = [str(info.get("title") or ""), str(info.get("desc") or "")]
+        aid = int(info.get("aid") or 0)
+        if aid:
+            try:
+                cookie = await self._get_bili_cookie()
+                data = await asyncio.to_thread(
+                    self._bili_get_json,
+                    f"https://api.bilibili.com/x/v2/reply/main?type=1&oid={aid}&mode=3",
+                    cookie,
+                )
+            except Exception:
+                data = None
+            if data and data.get("code") == 0:
+                for reply in (data.get("data") or {}).get("replies") or []:
+                    if isinstance(reply, dict):
+                        msg = _safe_str((reply.get("content") or {}).get("message"))
+                        if msg:
+                            parts.append(msg)
+        return html_to_text("\n".join(p for p in parts if p))
+
+    # B站匿名访问层（自包含，不依赖其它插件）
+    _BILI_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.bilibili.com/",
+        "Origin": "https://www.bilibili.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+
+    def _bili_get(self, url: str, cookie: str = "") -> tuple[int, bytes]:
+        headers = dict(self._BILI_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.request_timeout) as resp:
+                return resp.status, resp.read()
+        except Exception:
+            return 0, b""
+
+    def _bili_get_json(self, url: str, cookie: str = "") -> Optional[dict[str, Any]]:
+        status, body = self._bili_get(url, cookie)
+        if status != 200 or not body:
+            return None
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def _get_bili_cookie(self) -> str:
+        """匿名获取 buvid3（B站风控要求的最低限度 cookie）。"""
+        try:
+            data = await asyncio.to_thread(
+                self._bili_get_json, "https://api.bilibili.com/x/frontend/finger/spi"
+            )
+        except Exception:
+            data = None
+        if data and data.get("code") == 0:
+            b3 = _safe_str((data.get("data") or {}).get("b_3"))
+            if b3:
+                return f"buvid3={b3}"
+        return ""
+
+    async def _fetch_bili_video(self, bvid: str) -> dict[str, Any]:
+        """读取视频信息（标题/简介/aid/时长）。失败抛 SdkError。"""
+        cookie = await self._get_bili_cookie()
+        data = await asyncio.to_thread(
+            self._bili_get_json,
+            f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+            cookie,
+        )
+        if not data or data.get("code") != 0:
+            raise SdkError(f"视频信息没拿到喵（接口码 {(data or {}).get('code')}）。")
+        v = data.get("data") or {}
+        return {
+            "bvid": _safe_str(v.get("bvid")),
+            "aid": _safe_int(v.get("aid"), 0),
+            "title": _safe_str(v.get("title"), "未知标题"),
+            "desc": _safe_str(v.get("desc")),
+            "duration": _safe_int(v.get("duration"), 0),
+        }
+
+    async def _run_deep_search(self, query: str, max_pages: Optional[int] = None) -> str:
+        await self._ensure_config_loaded()
+        query = _safe_str(query)
+        if not query:
+            return "想让我深搜什么喵？/深搜 <问题>，比如：/深搜 原神最新直播兑换码"
+        limit = max(1, min(int(max_pages or self.deep_search_max_pages), 6))
+
+        # 1) 搜索：anysearch + B站搜索 双来源（互为备份，合并去重）
+        search_notes: list[str] = []
+        cards: list[dict[str, Any]] = []
+        try:
+            raw = await self.ctx.plugins.call_entry(
+                "anysearch:search", {"query": query, "max_results": 10}
+            )
+            search_text = raw.get("result") if isinstance(raw, dict) else str(raw)
+            cards = parse_search_cards(search_text or "")
+        except Exception as exc:
+            self.logger.warning("[deep_search] anysearch 失败: %s", exc)
+            search_notes.append("anysearch 调用失败")
+        try:
+            bili_cards = await self._bili_search_cards(query)
+        except Exception as exc:
+            self.logger.warning("[deep_search] B站搜索失败: %s", exc)
+            bili_cards = []
+            search_notes.append("B站搜索失败")
+        # 合并去重（按 URL），统一重编号——筛选解析按编号回查，必须连续
+        seen_urls: set[str] = set()
+        merged: list[dict[str, Any]] = []
+        for card in cards + bili_cards:
+            url = str(card.get("url") or "").rstrip("/")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            merged.append(card)
+        cards = [{**card, "index": i} for i, card in enumerate(merged, 1)]
+        if not cards:
+            note_text = f"（{'；'.join(search_notes)}）" if search_notes else ""
+            return (
+                f"呜…搜索这一步就没走通喵{note_text}。"
+                "本喵拿不到结果列表，没法帮你进页面核实。请检查网络后稍后再试。"
+            )
+
+        # 2) 筛选：按标题/摘要挑最可能藏答案的页面
+        select_prompt = build_select_prompt(query, cards)
+        selected, direct = [], ""
+        try:
+            select_raw = await self._call_llm_json("你是搜索代理的筛选引擎。", select_prompt)
+            selected, direct = parse_selection(select_raw, cards)
+        except SdkError as exc:
+            self.logger.warning("[deep_search] 筛选失败: %s", exc)
+            return str(exc)
+        if direct:
+            return f"不用翻页面喵，搜索摘要里就有答案：\n{direct}\n（来源：{cards[0].get('url', '')}）"
+        if not selected:
+            return "搜了一圈，标题和摘要看起来都不对劲喵，本喵没敢乱翻。换个更具体的关键词试试？"
+
+        # 2.5) 进度反馈：深搜要翻好几个页面，先让猫娘报个幕
+        if self.deep_search_progress:
+            try:
+                self.ctx.push_message(
+                    source=_PLUGIN_ID,
+                    visibility=[],
+                    ai_behavior="respond",
+                    parts=[{"type": "text", "text": (
+                        f"🔍 本喵拿到 {len(cards)} 条搜索结果，挑出了 {min(len(selected), limit)} 个最像的页面，"
+                        "现在开始逐个翻页核实喵，大概要等一小会儿…"
+                    )}],
+                    priority=3,
+                    metadata={"description": "🐱 深搜进行中"},
+                )
+            except Exception:
+                self.logger.warning("[deep_search] 进度推送失败")
+
+        # 3) 逐页抓取 + 分析 + 交叉核对
+        analyses: list[dict[str, Any]] = []
+        for card in selected[:limit]:
+            page_text = await self._deep_fetch_text(card.get("url", ""))
+            if not page_text:
+                analyses.append({"card": card, "analysis": {"relevant": False, "answer": "", "codes": [], "summary": ""}, "verified_codes": []})
+                continue
+            try:
+                analysis = parse_page_analysis(
+                    await self._call_llm_json(
+                        "你是搜索代理的阅读引擎。",
+                        build_page_prompt(query, card, page_text),
+                    )
+                )
+            except SdkError as exc:
+                self.logger.warning("[deep_search] 页面分析失败: %s", exc)
+                analysis = {"relevant": False, "answer": "", "codes": [], "summary": f"分析失败：{exc}"}
+            verified = cross_check_codes(analysis.get("codes", []), page_text)
+            analyses.append({"card": card, "analysis": analysis, "verified_codes": verified})
+            await asyncio.sleep(0.3)
+
+        # 4) 汇总（本地组装，只引用核实过的内容）
+        report = build_final_report(query, analyses, self.catgirl_name)
+        self.logger.info("[deep_search] 完成：%s（读了 %d 页）", query, len(analyses))
+        return report
+
+    @plugin_entry(
+        id="deep_search",
+        name="深度搜索",
+        description="搜索代理：搜索 → 按摘要筛选候选网页 → 逐页读取正文 → 交叉核实答案（如兑换码）→ 汇总报告。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "要核实的问题"},
+                "max_pages": {"type": "integer", "description": "最多读几个页面（1-6，默认配置值）"},
+            },
+            "required": ["query"],
+        },
+    )
+    async def deep_search_entry(self, query: str = "", max_pages: int = 0, **_):
+        try:
+            return Ok(await self._run_deep_search(query, max_pages or None))
+        except Exception as exc:
+            self.logger.exception("深搜失败: %s", exc)
+            return Err(SdkError(f"深搜出错了喵：{exc}"))
 
     async def _direct_plugin_call(self, rest: str, effective: str):
         """`/调用 插件id:入口id k=v|JSON`：跳过 AI 匹配，直连其它插件的能力。"""
