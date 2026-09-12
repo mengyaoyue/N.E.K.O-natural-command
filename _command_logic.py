@@ -1467,6 +1467,7 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_daily_fortune:daily_wife", "desc": "抽今日老婆（图片卡+计数+银金币奖励）", "args": {"user_id": "可选", "user_name": "可选"}},
     {"id": "neko_daily_fortune:fortune_card", "desc": "生成签文式运势卡图片（每天不同）", "args": {"user_id": "可选"}},
     {"id": "neko_daily_fortune:luck_rank", "desc": "幸运排行榜（累计幸运分）", "args": {}},
+    {"id": "neko_daily_fortune:open_platform", "desc": "在浏览器打开每日关怀平台网页（运势卡/老婆卡/排行）", "args": {}},
     {"id": "neko_clipboard_watcher:clipboard_now", "desc": "读取并点评剪贴板内容", "args": {}},
     {"id": "neko_clipboard_watcher:set_enabled", "desc": "开关剪贴板监听", "args": {"enabled": "true/false"}},
     {"id": "neko_watch_party:start_watch", "desc": "陪看B站视频", "args": {"video": "链接或BV号", "begin_now": "可选 true 立即开始"}},
