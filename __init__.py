@@ -611,9 +611,58 @@ class NaturalCommandPlugin(NekoPluginBase):
                 return 0, b"", ""
 
         status, body, ctype = await asyncio.to_thread(_get)
-        if status != 200 or not body:
+        text = ""
+        if status == 200 and body:
+            text = html_to_text(decode_page_body(body, ctype))
+        if len(text.strip()) >= 500:
+            return text
+        # 静态不足（JS 渲染 / 反爬 403 / 空壳）→ 交给深读卫星用真浏览器渲染
+        satellite_text = await self._satellite_read(url)
+        if len(satellite_text.strip()) > len(text.strip()):
+            return satellite_text
+        return text
+
+    async def _satellite_read(self, url: str) -> str:
+        """通过深读卫星插件用真浏览器读取页面（附属插件未装/失败时静默回退）。"""
+        try:
+            raw = await self.ctx.plugins.call_entry(
+                "neko_deep_fetch:read_page", {"url": url, "force_browser": True}
+            )
+        except Exception as exc:
+            self.logger.info("[deep_search] 卫星读页不可用: %s", exc)
             return ""
-        return html_to_text(decode_page_body(body, ctype))
+        report = raw
+        if isinstance(report, dict) and isinstance(report.get("result"), dict):
+            report = report["result"]
+        if isinstance(report, dict):
+            return str(report.get("text") or "")
+        return ""
+
+    async def _satellite_bing_cards(self, query: str) -> list[dict[str, Any]]:
+        """通过深读卫星用真浏览器做 Bing 搜索，返回深搜卡片。"""
+        try:
+            raw = await self.ctx.plugins.call_entry(
+                "neko_deep_fetch:bing_search", {"query": query, "max_results": 8}
+            )
+        except Exception as exc:
+            self.logger.info("[deep_search] 卫星 Bing 不可用: %s", exc)
+            return []
+        payload = raw
+        if isinstance(payload, dict) and "result" in payload:
+            payload = payload["result"]
+        if not isinstance(payload, dict):
+            return []
+        cards: list[dict[str, Any]] = []
+        for item in payload.get("results") or []:
+            if isinstance(item, dict) and _safe_str(item.get("url")):
+                cards.append(
+                    {
+                        "title": _safe_str(item.get("title")),
+                        "url": _safe_str(item.get("url")),
+                        "desc": "",
+                    }
+                )
+        return cards
 
     async def _bili_search_cards(self, query: str) -> list[dict[str, Any]]:
         """B站搜索（匿名）：把视频结果转成深搜卡片（兑换码视频是重要来源）。"""

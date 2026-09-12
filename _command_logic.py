@@ -1466,6 +1466,8 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_watch_party:jump_to", "desc": "陪看进度校准", "args": {"minute": "当前看到第几分钟"}},
     {"id": "neko_watch_party:react_now", "desc": "针对当前播放位置现场反应", "args": {}},
     {"id": "neko_watch_party:stop_watch", "desc": "结束陪看并总结", "args": {}},
+    {"id": "neko_deep_fetch:read_page", "desc": "深读网页（真浏览器渲染，可读 JS 页/反爬页）", "args": {"url": "网页地址", "force_browser": "可选 true 跳过静态"}},
+    {"id": "neko_deep_fetch:bing_search", "desc": "真浏览器 Bing 搜索，返回结果列表", "args": {"query": "搜索词"}},
 ]
 
 
