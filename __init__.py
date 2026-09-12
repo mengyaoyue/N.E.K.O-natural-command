@@ -20,9 +20,28 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return default
+    return default
 from typing import Any, Optional
 
 from plugin.sdk.plugin import (
@@ -61,6 +80,7 @@ from ._command_logic import (
     render_entry_list,
     render_plugin_list,
     safe_str as _safe_str,
+    parse_video_id,
     shortlist_commands,
 )
 
