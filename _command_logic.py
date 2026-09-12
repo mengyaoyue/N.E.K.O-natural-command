@@ -268,6 +268,33 @@ def safe_str(value: Any, default: str = "") -> str:
     return s if s else default
 
 
+_BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
+_AV_RE = re.compile(r"(?:^|[^0-9A-Za-z])av(\d{1,15})(?:[^0-9]|$)", re.IGNORECASE)
+_PAGE_RE = re.compile(r"[?&]p=(\d{1,4})")
+
+
+def parse_video_id(text: str) -> Optional[dict[str, Any]]:
+    """从任意文本里解析 B 站视频标识。
+
+    支持：完整链接（含 ?p=2 分P）、裸 BV 号、av 号。
+    返回 ``{"bvid"|"aid", "page": int}``，解析失败返回 ``None``。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    bv = _BV_RE.search(text)
+    if bv:
+        page = 1
+        page_match = _PAGE_RE.search(text)
+        if page_match:
+            page = max(1, int(page_match.group(1)))
+        return {"bvid": bv.group(0), "page": page}
+    av = _AV_RE.search(text)
+    if av:
+        return {"aid": int(av.group(1)), "page": 1}
+    return None
+
+
 # ── 威胁等级（AI 安全审查的三档判定）────────────────────────────
 # 由 AI 在“创建 / 匹配”同一轮里顺手给出，不额外增加一次模型调用。
 RISK_HARMLESS = "harmless"          # 无害：只读 / 打开 / 回复，不影响设备资料
