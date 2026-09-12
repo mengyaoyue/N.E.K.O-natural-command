@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>自然语言命令 · 管理面板</title>
+<style>
+body{margin:0;font-family:'Microsoft YaHei',sans-serif;background:#1b1826;color:#e8e4f2;display:flex;justify-content:center;padding:24px}
+.wrap{max-width:860px;width:100%}
+h1{font-size:24px;margin:8px 0 4px}
+.sub{color:#9a93b5;font-size:14px;margin-bottom:16px}
+.card{background:#241f33;border:1px solid #3a3352;border-radius:16px;padding:16px;margin-bottom:16px}
+.card h2{font-size:17px;margin:2px 0 12px;color:#c9b9ff}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:6px;border-bottom:1px solid #322b4a}
+button{background:#6c5ce7;color:#fff;border:0;border-radius:10px;padding:7px 16px;font-size:13px;cursor:pointer;margin-right:8px}
+button:hover{background:#7d6ef0}
+.toggle{display:inline-block;padding:4px 12px;border-radius:20px;font-size:13px}
+.on{background:#1f4a2e;color:#7be3a2}
+.off{background:#4a1f2a;color:#e37b8f}
+#status{color:#9a93b5;font-size:13px;margin-left:8px}
+.kv td:first-child{color:#9a93b5;width:190px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🗣 自然语言命令 · 管理面板</h1>
+  <div class="sub">猫娘插件矩阵的核心调度：说人话触发命令，未命中自动学新命令</div>
+  <div class="card">
+    <h2>状态</h2>
+    <table class="kv" id="kv"></table>
+    <button onclick="doReload()">重载命令库 + 能力表</button>
+    <button onclick="toggleAutoCreate()">切换自动学命令</button>
+    <span id="status"></span>
+  </div>
+  <div class="card">
+    <h2>命令库（<span id="cmdCount">0</span> 条）</h2>
+    <table id="cmdTable"></table>
+  </div>
+  <div class="card">
+    <h2>可调用的插件能力（<span id="entryCount">0</span> 个）</h2>
+    <table id="entryTable"></table>
+  </div>
+</div>
+<script>
+function findBase(){
+  const bases = [""];
+  for (let p = 15680; p <= 15684; p++) bases.push(`http://127.0.0.1:${p}`);
+  return bases;
+}
+let API_BASE = localStorage.getItem("nc_panel_base") || "";
+async function api(path, opts){
+  const bases = [API_BASE, ...findBase()].filter((v,i,a)=>a.indexOf(v)===i);
+  for (const base of bases){
+    try{
+      const r = await fetch(base + path, opts);
+      if (r.ok){ API_BASE = base; localStorage.setItem("nc_panel_base", base); return await r.json(); }
+    }catch(e){}
+  }
+  throw new Error("面板服务不可达喵");
+}
+async function loadStatus(){
+  try{
+    const d = await api("/api/status");
+    document.getElementById("kv").innerHTML = [
+      ["管理员密码", d.admin_password_set ? "✅ 已设置" : "⛔ 未设置（插件禁用中）"],
+      ["自动学新命令", d.auto_create ? "✅ 开" : "⛔ 关"],
+      ["当前权限状态", d.user_permission],
+      ["对话模型", `${d.model.model}（${d.model.base_url}）`],
+      ["已安装插件", d.installed_plugins.length + " 个"],
+    ].map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+    document.getElementById("cmdCount").textContent = d.command_count;
+    document.getElementById("cmdTable").innerHTML = d.commands.map(c=>
+      `<tr><td>${c.name}</td><td>${c.id}</td><td>${c.type}</td><td>${c.permission==="admin"?"🔒":"👤"}</td></tr>`).join("");
+    document.getElementById("entryCount").textContent = d.entries.length;
+    document.getElementById("entryTable").innerHTML = d.entries.map(e=>
+      `<tr><td>${e.id}</td><td>${e.desc}</td></tr>`).join("");
+    document.getElementById("status").textContent = "已更新喵～";
+  }catch(e){ document.getElementById("status").textContent = "加载失败：" + e; }
+}
+async function doReload(){
+  try{ const d = await api("/api/reload", {method:"POST", body:"{}"}); await loadStatus(); }
+  catch(e){ document.getElementById("status").textContent = "失败：" + e; }
+}
+async function toggleAutoCreate(){
+  try{
+    const cur = confirm("确认切换「自动学新命令」？确定=开启，取消=关闭");
+    const d = await api("/api/toggle_auto_create", {method:"POST", body:JSON.stringify({enabled:cur})});
+    await loadStatus();
+  }catch(e){ document.getElementById("status").textContent = "失败：" + e; }
+}
+loadStatus();
+</script>
+</body>
+</html>

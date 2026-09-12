@@ -36,6 +36,7 @@ from plugin.sdk.plugin import (
     neko_plugin,
 )
 
+from ._panel import PanelServer, find_open_port
 from ._command_logic import (
     CommandRegistry,
     DEFAULT_ENTRY_REGISTRY,
@@ -162,6 +163,9 @@ class NaturalCommandPlugin(NekoPluginBase):
         self._installed: list[dict[str, Any]] = []
         self._capability_text: str = ""
         self.plugins_dir: Optional[Path] = None
+        self._panel_server = None
+        self._panel_port: int = 15680
+        self._panel_lock = threading.Lock()
         self.entry_registry_path: Optional[Path] = None
 
         self.registry = CommandRegistry(
@@ -207,6 +211,13 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.deep_search_progress = settings["deep_search_progress"]
         self.catgirl_name = settings["catgirl_name"]
         self._config_loaded = True
+        try:
+            override = self._load_panel_state().get("auto_create")
+            if override is not None:
+                self.auto_create = bool(override)
+                self.registry.auto_create = bool(override)
+        except Exception:
+            pass
         self._probe_context()
 
         # 插件互联：数据目录 / 平级插件目录在拿到 data_path 后初始化一次
@@ -257,6 +268,90 @@ class NaturalCommandPlugin(NekoPluginBase):
         raise SdkError(
             f"跨插件调用不可用喵：当前宿主 SDK 没有可用的调用入口（试过 {len(attempts)} 种形态）。最后错误：{last_error}"
         )
+
+    def _panel_state_path(self) -> Path:
+        return Path(self.data_path()) / "panel_state.json"
+
+    def _load_panel_state(self) -> dict:
+        try:
+            data = json.loads(self._panel_state_path().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_panel_state(self, state: dict) -> None:
+        try:
+            self._panel_state_path().parent.mkdir(parents=True, exist_ok=True)
+            self._panel_state_path().write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _start_panel(self) -> None:
+        """启动管理面板（仅 127.0.0.1）并注册 static UI。"""
+        endpoints = {
+            ("GET", "/api/status"): self._panel_status,
+            ("POST", "/api/reload"): self._panel_reload,
+            ("POST", "/api/toggle_auto_create"): self._panel_toggle_auto_create,
+        }
+        server = PanelServer(self._panel_port, self._panel_html, endpoints)
+        if server.start():
+            self._panel_server = server
+            self.logger.info("[natural_command] 管理面板已启动: http://127.0.0.1:{}", self._panel_port)
+            try:
+                registered = self.register_static_ui("static")
+                self.logger.info("[natural_command] static UI 注册: {}", registered)
+            except Exception as exc:
+                self.logger.warning("[natural_command] static UI 注册失败: {}", exc)
+        else:
+            self.logger.warning("[natural_command] 管理面板启动失败（端口占用）")
+
+    def _panel_status(self, _body: dict) -> dict:
+        with self._panel_lock:
+            model_info = {}
+            try:
+                from utils.config_manager import get_config_manager
+                cfg = get_config_manager().get_model_api_config("conversation")
+                model_info = {"model": _safe_str(cfg.get("model")), "base_url": _safe_str(cfg.get("base_url"))}
+            except Exception:
+                model_info = {"model": "（未配置）", "base_url": ""}
+            state = self._load_panel_state()
+            auto_create = bool(state.get("auto_create", self.auto_create))
+            return {
+                "admin_password_set": bool(self.admin_password),
+                "auto_create": auto_create,
+                "command_count": len(self.registry.commands),
+                "commands": [
+                    {"id": cid, "name": c.get("name", cid), "type": str(c.get("type", "reply")),
+                     "permission": str(c.get("permission", "user"))}
+                    for cid, c in self.registry.commands.items()
+                ],
+                "entries": [{"id": e["id"], "desc": e.get("desc", "")} for e in self._entries],
+                "installed_plugins": [p["id"] for p in self._installed],
+                "user_permission": self.registry.user_permission,
+                "model": model_info,
+                "panel_port": self._panel_port,
+            }
+
+    def _panel_reload(self, _body: dict) -> dict:
+        self.registry.reload()
+        self._refresh_capabilities()
+        return {"ok": True, "command_count": len(self.registry.commands)}
+
+    def _panel_toggle_auto_create(self, body: dict) -> dict:
+        enabled = bool(body.get("enabled"))
+        self.auto_create = enabled
+        self.registry.auto_create = enabled
+        state = self._load_panel_state()
+        state["auto_create"] = enabled
+        self._save_panel_state(state)
+        return {"ok": True, "auto_create": enabled}
+
+    def _panel_html(self) -> str:
+        page = Path(__file__).parent / "static" / "index.html"
+        try:
+            return page.read_text(encoding="utf-8")
+        except Exception:
+            return "<h1>面板页缺失喵（static/index.html）</h1>"
 
     def _probe_context(self) -> None:
         """把 ctx 的真实属性写进日志，便于确认跨插件 API 形态。"""
@@ -314,6 +409,7 @@ class NaturalCommandPlugin(NekoPluginBase):
                 _PLUGIN_ID,
             )
         self._auto_clean_commands()
+        self._start_panel()
         try:
             healed = refresh_builtin_examples(self.registry.commands)
             if healed:
@@ -358,6 +454,8 @@ class NaturalCommandPlugin(NekoPluginBase):
 
     @lifecycle(id="shutdown")
     async def on_shutdown(self) -> None:
+        if self._panel_server:
+            self._panel_server.stop()
         self.registry._save()
         self.logger.info("[natural_command] 关闭")
 
