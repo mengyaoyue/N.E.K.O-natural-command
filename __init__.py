@@ -18,6 +18,7 @@ v0.2.0：
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import threading
@@ -255,8 +256,12 @@ class NaturalCommandPlugin(NekoPluginBase):
     async def _call_entry(self, target: str, args: Optional[dict[str, Any]] = None, timeout: float = 30.0) -> Any:
         """跨插件调用：兼容本宿主 SDK 的多种 API 形态。
 
-        宿主二进制里实测存在 call_plugin_entry(target_plugin_id, entry_id, payload, timeout)，
-        而部分插件示例用的 ctx.plugins.call_entry("id:entry", args) 在当前版本不存在。
+        当前宿主（SdkContext）实测可用的跨插件入口是
+        ctx.trigger_plugin_event(target_plugin_id=…, event_type="adapter_call",
+                                 event_id=…, params=…, timeout=…)，
+        与官方 mcp_adapter 插件用法一致；它可能返回协程，也可能直接返回结果，
+        这里两种都兼容。ctx.plugins.call_entry / ctx.call_plugin_entry 等旧写法
+        在当前版本并不存在，只作为兼容回退。
         按优先级探测，成功一种后不再尝试其它形态。
         """
         plugin_id, _, entry_id = target.partition(":")
@@ -264,6 +269,19 @@ class NaturalCommandPlugin(NekoPluginBase):
         attempts: list[tuple[str, Any]] = []
         ctx = getattr(self, "ctx", None)
         if ctx is not None:
+            if hasattr(ctx, "trigger_plugin_event"):
+                attempts.append(
+                    (
+                        "ctx.trigger_plugin_event",
+                        lambda: ctx.trigger_plugin_event(
+                            target_plugin_id=plugin_id,
+                            event_type="adapter_call",
+                            event_id=entry_id,
+                            params=dict(args),
+                            timeout=float(timeout),
+                        ),
+                    )
+                )
             plugins = getattr(ctx, "plugins", None)
             if plugins is not None and hasattr(plugins, "call_entry"):
                 attempts.append(("ctx.plugins.call_entry", lambda: plugins.call_entry(target, args)))
@@ -278,7 +296,10 @@ class NaturalCommandPlugin(NekoPluginBase):
         last_error: Optional[Exception] = None
         for name, call in attempts:
             try:
-                return await asyncio.wait_for(call(), timeout=timeout)
+                result = call()
+                if inspect.isawaitable(result):
+                    result = await asyncio.wait_for(result, timeout=timeout)
+                return result
             except (AttributeError, TypeError) as exc:
                 last_error = exc
                 self.logger.warning("[natural_command] 跨插件调用形态 %s 不可用: %s", name, exc)
