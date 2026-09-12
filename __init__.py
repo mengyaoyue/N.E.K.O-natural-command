@@ -150,9 +150,11 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.default_type: str = "reply"
         self.llm_timeout: float = 20.0
         self.shell_timeout: float = 30.0
+        self.request_timeout: float = 20.0
         self.direct_call_permission: str = "user"
         self.deep_search_max_pages: int = 4
         self.deep_search_progress: bool = True
+        self.catgirl_name: str = "猫娘"
         self._config_loaded: bool = False
 
         # 插件互联（v0.4）：能力注册表 + 已安装插件清单 → 注入匹配提示词
@@ -193,6 +195,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.default_type = settings["default_type"]
         self.llm_timeout = settings["llm_timeout"]
         self.shell_timeout = settings["shell_timeout"]
+        self.request_timeout = settings["request_timeout"]
 
         self.registry.admin_password = self.admin_password
         self.registry.auto_create = self.auto_create
@@ -202,6 +205,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.direct_call_permission = settings["direct_call_permission"]
         self.deep_search_max_pages = settings["deep_search_max_pages"]
         self.deep_search_progress = settings["deep_search_progress"]
+        self.catgirl_name = settings["catgirl_name"]
         self._config_loaded = True
         self._probe_context()
 

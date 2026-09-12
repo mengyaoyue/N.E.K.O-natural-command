@@ -343,12 +343,16 @@ def load_settings(section: Any) -> dict[str, Any]:
         "llm_timeout": safe_float(section.get("llm_timeout"), 20.0),
         # 0 / 负数意味着"无限等待"，统一钳制到最小 1 秒
         "shell_timeout": max(1.0, safe_float(section.get("shell_timeout"), 30.0)),
+        # 单次网络请求 / 跨插件调用超时（秒），深搜抓取与 B 站接口共用
+        "request_timeout": max(1.0, safe_float(section.get("request_timeout"), 20.0)),
         # /调用 直调其它插件能力的权限门槛：user（默认）/ admin
         "direct_call_permission": "admin" if safe_str(section.get("direct_call_permission"), "user").lower() == "admin" else "user",
         # 深搜最多读几个页面（1-6）
         "deep_search_max_pages": max(1, min(int(safe_float(section.get("deep_search_max_pages"), 4)), 6)),
         # 深搜开始时是否推送进度提示
         "deep_search_progress": safe_bool(section.get("deep_search_progress"), True),
+        # 深搜报告署名用的猫娘名字
+        "catgirl_name": safe_str(section.get("catgirl_name"), "猫娘") or "猫娘",
     }
 
 
@@ -1460,6 +1464,9 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_daily_fortune:fortune", "desc": "今日运势签/摸鱼指数", "args": {}},
     {"id": "neko_daily_fortune:morning_report", "desc": "早安摸鱼日报（周末/发薪日倒计时+运势速览）", "args": {}},
     {"id": "neko_daily_fortune:set_switch", "desc": "开关日报/喝水提醒", "args": {"feature": "morning_push/water_reminder", "enabled": "true/false"}},
+    {"id": "neko_daily_fortune:daily_wife", "desc": "抽今日老婆（图片卡+计数+银金币奖励）", "args": {"user_id": "可选", "user_name": "可选"}},
+    {"id": "neko_daily_fortune:fortune_card", "desc": "生成签文式运势卡图片（每天不同）", "args": {"user_id": "可选"}},
+    {"id": "neko_daily_fortune:luck_rank", "desc": "幸运排行榜（累计幸运分）", "args": {}},
     {"id": "neko_clipboard_watcher:clipboard_now", "desc": "读取并点评剪贴板内容", "args": {}},
     {"id": "neko_clipboard_watcher:set_enabled", "desc": "开关剪贴板监听", "args": {"enabled": "true/false"}},
     {"id": "neko_watch_party:start_watch", "desc": "陪看B站视频", "args": {"video": "链接或BV号", "begin_now": "可选 true 立即开始"}},
