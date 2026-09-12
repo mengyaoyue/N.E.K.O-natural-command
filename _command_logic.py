@@ -1533,6 +1533,9 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_deep_fetch:read_page", "desc": "深读网页（真浏览器渲染，可读 JS 页/反爬页）", "args": {"url": "网页地址", "force_browser": "可选 true 跳过静态"}},
     {"id": "neko_deep_fetch:bing_search", "desc": "真浏览器 Bing 搜索，返回结果列表", "args": {"query": "搜索词"}},
     {"id": "neko_voice_input:open_panel", "desc": "打开语音草稿箱面板（说话转文字可编辑后发送）", "args": {}},
+    {"id": "neko_model_radar:radar_free", "desc": "当前免费模型清单（每小时更新）", "args": {}},
+    {"id": "neko_model_radar:radar_best", "desc": "赛道性价比排行", "args": {"track": "通用对话/代码/角色扮演/图片生成/语音/长文本"}},
+    {"id": "neko_model_radar:radar_gifts", "desc": "各平台赠送/免费额度情报", "args": {}},
 ]
 
 
