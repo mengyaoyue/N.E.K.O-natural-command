@@ -37,17 +37,26 @@ from plugin.sdk.plugin import (
 
 from ._command_logic import (
     CommandRegistry,
+    DEFAULT_ENTRY_REGISTRY,
+    build_capability_section,
     build_create_prompt,
     build_endpoint_candidates,
     build_match_prompt,
+    discover_installed_plugins,
     extract_json_object,
     extract_new_command,
     format_command_lines,
     format_plugin_result,
+    harvest_entries_from_commands,
     is_exit_admin,
+    load_entry_registry,
     load_settings,
+    merge_entry_registry,
     normalize_action,
+    parse_direct_call_args,
     parse_user_input,
+    render_entry_list,
+    render_plugin_list,
     safe_str as _safe_str,
     shortlist_commands,
 )
@@ -69,11 +78,12 @@ _HELP_TEXT = (
     "📖 自然语言命令速查喵～\n"
     "- /<任意自然语言>：AI 先在命令库匹配，命中即执行；未命中会自动学一条新命令\n"
     "- 带参数的命令（如「B站搜索 原神」）：搜索词会自动提取，下次任何关键词都能直接用\n"
-    "- 「查一查/搜一下」类需求会调用其他插件的能力（如联网搜索 anysearch）\n"
+    "- 「查一查/搜一下」类需求会调用其它插件的能力（联网搜索/运势/陪看…）\n"
+    "- /插件：查看本机插件与可直接调用的能力；/调用 插件id:入口id 参数=值：直调插件能力\n"
     "- /cmdlist：列出全部命令；/findcmd <关键词>：按关键词筛选命令\n"
     "- /delcmd <命令ID>：删除命令（admin 级命令需先提权）\n"
     "- /su <密码>：切换管理员权限；/退出管理员 等同义命令可降权\n"
-    "- /reloadcmd：重新加载命令库\n"
+    "- /reloadcmd：重新加载命令库与插件能力表\n"
     "安全：命令分 harmless / indeterminate / harmful 三档，只有 harmful 需要 /su 提权后执行喵。"
 )
 
@@ -125,7 +135,15 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.default_type: str = "reply"
         self.llm_timeout: float = 20.0
         self.shell_timeout: float = 30.0
+        self.direct_call_permission: str = "user"
         self._config_loaded: bool = False
+
+        # 插件互联（v0.4）：能力注册表 + 已安装插件清单 → 注入匹配提示词
+        self._entries: list[dict[str, Any]] = []
+        self._installed: list[dict[str, Any]] = []
+        self._capability_text: str = ""
+        self.plugins_dir: Optional[Path] = None
+        self.entry_registry_path: Optional[Path] = None
 
         self.registry = CommandRegistry(
             commands_path=self.commands_path,
@@ -164,11 +182,51 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.registry.default_permission = self.default_permission
         self.registry.default_type = self.default_type
         self.registry.shell_timeout = self.shell_timeout
+        self.direct_call_permission = settings["direct_call_permission"]
         self._config_loaded = True
+
+        # 插件互联：数据目录 / 平级插件目录在拿到 data_path 后初始化一次
+        if self.entry_registry_path is None:
+            data_dir = Path(self.data_path())
+            self.entry_registry_path = data_dir / "plugin_links.json"
+            self.plugins_dir = data_dir.parent.parent
+        self._refresh_capabilities()
 
     async def _ensure_config_loaded(self) -> None:
         if not self._config_loaded:
             await self._load_config()
+
+    # ── 插件互联（v0.4）────────────────────────────────────────
+    def _refresh_capabilities(self) -> None:
+        """重建能力注册表与已安装插件清单，并渲染成提示词文本块。
+
+        数据来源三层合并（用户 plugin_links.json > 精选默认 > 命令库收割）；
+        已安装插件只读平级目录的 plugin.toml 清单，绝不改动其它插件。
+        任何失败都不影响插件主流程。
+        """
+        try:
+            harvested = harvest_entries_from_commands(self.registry.commands)
+            curated = list(DEFAULT_ENTRY_REGISTRY)
+            user = load_entry_registry(self.entry_registry_path) if self.entry_registry_path else []
+            self._entries = merge_entry_registry(curated, harvested, user)
+        except Exception as exc:
+            self.logger.warning("[natural_command] 能力注册表构建失败：%s", exc)
+            self._entries = list(DEFAULT_ENTRY_REGISTRY)
+        try:
+            self._installed = discover_installed_plugins(
+                str(self.plugins_dir) if self.plugins_dir else None, _PLUGIN_ID
+            )
+        except Exception as exc:
+            self.logger.warning("[natural_command] 已安装插件扫描失败：%s", exc)
+            self._installed = []
+        self._capability_text = build_capability_section(self._entries, self._installed)
+        self.logger.info(
+            "[natural_command] 能力表已刷新：%d 个可调用入口，%d 个已安装插件",
+            len(self._entries), len(self._installed),
+        )
+
+    def _plugin_overview(self) -> str:
+        return render_entry_list(self._entries) + "\n\n" + render_plugin_list(self._installed)
 
     # ── 生命周期 ───────────────────────────────────────────────
     @lifecycle(id="startup")
@@ -305,6 +363,7 @@ class NaturalCommandPlugin(NekoPluginBase):
             auto_create=self.auto_create,
             default_permission=self.default_permission,
             default_type=self.default_type,
+            capability_text=self._capability_text,
         )
         return await self._call_llm_json("你是一个命令路由引擎。", prompt)
 
@@ -362,7 +421,7 @@ class NaturalCommandPlugin(NekoPluginBase):
             return Ok(self._list_commands(keyword=rest))
         if builtin == "helpcmd":
             return Ok(_HELP_TEXT)
-        if builtin == "delcmd":
+        if builtin in ("delcmd",):
             rest = user_input[len("delcmd"):].strip()
             return Ok(self._delete_command(rest, permission=effective))
         if builtin == "su":
@@ -370,7 +429,13 @@ class NaturalCommandPlugin(NekoPluginBase):
             return Ok(self._switch_permission(rest))
         if builtin == "reloadcmd":
             self.registry.reload()
-            return Ok("已刷新命令配置")
+            self._refresh_capabilities()
+            return Ok("已刷新命令配置（含插件能力表）")
+        # 插件互联：查看能力 / 直调其它插件
+        if builtin in ("plugin", "插件", "pluginlist", "插件列表"):
+            return Ok(self._plugin_overview())
+        if builtin in ("调用", "call"):
+            return await self._direct_plugin_call(user_input[len(builtin):].strip(), effective)
 
         # AI 语义匹配或自动创建（威胁审查 risk 与匹配/创建并入同一轮，不额外调用模型）
         try:
@@ -478,6 +543,32 @@ class NaturalCommandPlugin(NekoPluginBase):
             )}
         return {"success": True, "output": format_plugin_result(target, result)}
 
+    async def _direct_plugin_call(self, rest: str, effective: str):
+        """`/调用 插件id:入口id k=v|JSON`：跳过 AI 匹配，直连其它插件的能力。"""
+        if not rest:
+            return Ok(
+                "用法喵：/调用 插件id:入口id 参数=值 …\n"
+                "例：/调用 anysearch:search query=原神\n"
+                "也支持 JSON：/调用 neko_watch_party:start_watch {\"video\": \"BV...\", \"begin_now\": true}\n"
+                "有哪些能力可用：/插件"
+            )
+        parts = rest.split(None, 1)
+        target = parts[0]
+        if ":" not in target:
+            return Ok(f"「{target}」不是有效的 插件id:入口id 喵。用 /插件 看看有哪些能力可用～")
+        # 权限门控：直调是在越过 AI 审查直接指挥其它插件，可配置要求提权
+        if self.direct_call_permission == "admin" and effective != "admin":
+            return Ok("直调插件能力需要管理员权限喵：请先 /su <密码> 提权。")
+        args, note = parse_direct_call_args(parts[1] if len(parts) > 1 else "")
+        self.logger.info("[natural_command] 直调插件能力 target=%s args=%s", target, args)
+        result = await self._run_plugin_command({"type": "plugin", "content": target, "name": target}, args)
+        output = result["output"]
+        if note:
+            output += note
+        if result["success"]:
+            return Ok(output)
+        return Err(SdkError(output))
+
     async def _create_and_run(
         self,
         new_cmd: dict[str, Any],
@@ -486,6 +577,9 @@ class NaturalCommandPlugin(NekoPluginBase):
     ):
         created = self.registry.add_command(new_cmd)
         cmd_id = created.get("id", new_cmd.get("id"))
+        if str(created.get("type", "")).lower() == "plugin":
+            # 新学会的插件能力自动进能力表，下次匹配提示词就能看到
+            self._refresh_capabilities()
         effective = self.registry.user_permission if allow_admin else "user"
         exec_result = await self._dispatch_command(cmd_id, effective, args=args)
         head = (
@@ -503,6 +597,7 @@ class NaturalCommandPlugin(NekoPluginBase):
             user_input=user_input,
             default_permission=self.default_permission,
             default_type=self.default_type,
+            capability_text=self._capability_text,
         )
         try:
             result = await self._call_llm_json("你是一个命令生成引擎。", prompt)

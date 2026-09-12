@@ -158,6 +158,7 @@ def build_create_prompt(
     user_input: str,
     default_permission: str,
     default_type: str,
+    capability_text: str = "",
 ) -> str:
     """构造“为用户输入生成一条新命令”的提示词。
 
@@ -184,15 +185,8 @@ def build_create_prompt(
 命令类型说明：
 - reply：文本回复（猫娘口吻）
 - shell：本机命令行
-- plugin：调用其他 N.E.K.O 插件的能力。已知可用的有：
-  * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
-  * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
-  * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
-  * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
-  * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
-  * neko_watch_party:start_watch —— 陪看B站视频（参数 {"video": "链接或BV号", "begin_now": true}）；用户想让你陪着看B站视频时用它
-  * neko_watch_party:jump_to —— 陪看进度校准（参数 {"minute": 当前看到第几分钟}）
-  * neko_watch_party:stop_watch —— 结束陪看并输出总结（无需参数）
+- plugin：调用其他 N.E.K.O 插件的能力，content 写 插件id:入口id
+{capability_text}
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄）：
@@ -310,6 +304,8 @@ def load_settings(section: Any) -> dict[str, Any]:
         "llm_timeout": safe_float(section.get("llm_timeout"), 20.0),
         # 0 / 负数意味着"无限等待"，统一钳制到最小 1 秒
         "shell_timeout": max(1.0, safe_float(section.get("shell_timeout"), 30.0)),
+        # /调用 直调其它插件能力的权限门槛：user（默认）/ admin
+        "direct_call_permission": "admin" if safe_str(section.get("direct_call_permission"), "user").lower() == "admin" else "user",
     }
 
 
@@ -1411,6 +1407,216 @@ def format_command_lines(
     return "\n".join(lines)
 
 
+# ══ 插件互联（v0.4）：以自然语言命令为核心调度其它插件 ═══════════════
+
+# 精选可调用能力（作者自己的插件 + 常用内置）。用户可用 plugin_links.json 增补，
+# AI 创建的 plugin 类型命令也会被自动收割进能力表。
+DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
+    {"id": "anysearch:search", "desc": "联网搜索", "args": {"query": "关键词"}},
+    {"id": "sys_monitor:a_status", "desc": "查看本机 CPU/内存/磁盘/电量状态", "args": {}},
+    {"id": "neko_daily_fortune:fortune", "desc": "今日运势签/摸鱼指数", "args": {}},
+    {"id": "neko_daily_fortune:morning_report", "desc": "早安摸鱼日报（周末/发薪日倒计时+运势速览）", "args": {}},
+    {"id": "neko_daily_fortune:set_switch", "desc": "开关日报/喝水提醒", "args": {"feature": "morning_push/water_reminder", "enabled": "true/false"}},
+    {"id": "neko_clipboard_watcher:clipboard_now", "desc": "读取并点评剪贴板内容", "args": {}},
+    {"id": "neko_clipboard_watcher:set_enabled", "desc": "开关剪贴板监听", "args": {"enabled": "true/false"}},
+    {"id": "neko_watch_party:start_watch", "desc": "陪看B站视频", "args": {"video": "链接或BV号", "begin_now": "可选 true 立即开始"}},
+    {"id": "neko_watch_party:jump_to", "desc": "陪看进度校准", "args": {"minute": "当前看到第几分钟"}},
+    {"id": "neko_watch_party:react_now", "desc": "针对当前播放位置现场反应", "args": {}},
+    {"id": "neko_watch_party:stop_watch", "desc": "结束陪看并总结", "args": {}},
+]
+
+
+def discover_installed_plugins(plugins_dir: Optional[str], self_id: str) -> list[dict[str, Any]]:
+    """扫描已安装插件目录，读取每个插件 plugin.toml 的基本信息。
+
+    只**读**兄弟目录的 plugin.toml 清单，不碰任何其它插件的代码/配置/数据。
+    返回 ``[{"id","name","description","version","author"}]``，按 id 排序。
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # 兼容 <3.11 的本机测试环境
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError:
+            return []
+    base = Path(plugins_dir) if plugins_dir else None
+    if base is None or not base.is_dir():
+        return []
+    found: list[dict[str, Any]] = []
+    for child in sorted(base.iterdir()):
+        try:
+            if not child.is_dir() or child.name == self_id:
+                continue
+            manifest = child / "plugin.toml"
+            if not manifest.is_file():
+                continue
+            data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            section = data.get("plugin") or {}
+            pid = safe_str(section.get("id")) or child.name
+            if not pid or pid == self_id:
+                continue
+            author = section.get("author")
+            found.append(
+                {
+                    "id": pid,
+                    "name": safe_str(section.get("name"), pid),
+                    "description": safe_str(section.get("description"))[:120],
+                    "version": safe_str(section.get("version"), "0.0.0"),
+                    "author": safe_str(author.get("name") if isinstance(author, dict) else author),
+                }
+            )
+        except Exception:
+            continue
+    found.sort(key=lambda item: item["id"])
+    return found
+
+
+def load_entry_registry(path: Any) -> list[dict[str, Any]]:
+    """读取用户自维护的能力注册表 plugin_links.json；损坏/缺失返回空表。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in entries:
+        if isinstance(item, dict) and ":" in safe_str(item.get("id")):
+            result.append(
+                {
+                    "id": safe_str(item.get("id")),
+                    "desc": safe_str(item.get("desc")),
+                    "args": item.get("args") if isinstance(item.get("args"), dict) else {},
+                }
+            )
+    return result
+
+
+def save_entry_registry(path: Any, entries: list[dict[str, Any]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(
+        json.dumps({"entries": entries}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def harvest_entries_from_commands(commands: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """从命令库收割 plugin 类型命令的调用目标（AI 用过并保存的 = 已验证可用）。"""
+    harvested: list[dict[str, Any]] = []
+    for cmd in commands.values():
+        if not isinstance(cmd, dict) or str(cmd.get("type", "")).lower() != "plugin":
+            continue
+        target = safe_str(cmd.get("content"))
+        if ":" not in target:
+            continue
+        name = safe_str(cmd.get("name"))
+        desc = safe_str(cmd.get("description"))
+        harvested.append({"id": target, "desc": "：".join(p for p in (name, desc) if p), "args": {}})
+    return harvested
+
+
+def merge_entry_registry(
+    curated: list[dict[str, Any]],
+    harvested: list[dict[str, Any]],
+    user: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """合并能力注册表：用户自加 > 精选 > 收割，同 id 高优先级胜出。"""
+    priority_map: dict[str, int] = {}
+    merged: dict[str, dict[str, Any]] = {}
+    for source, priority in ((harvested, 0), (curated, 1), (user, 2)):
+        for item in source:
+            item_id = safe_str(item.get("id"))
+            if not item_id or ":" not in item_id:
+                continue
+            existing = merged.get(item_id)
+            if existing is None or priority > priority_map.get(item_id, -1):
+                entry = {"id": item_id, "desc": safe_str(item.get("desc")), "args": item.get("args") or {}}
+                merged[item_id] = entry
+                priority_map[item_id] = priority
+    return [merged[k] for k in sorted(merged)]
+
+
+def build_capability_section(entries: list[dict[str, Any]], installed: list[dict[str, Any]]) -> str:
+    """把能力表 + 已安装插件清单渲染成注入提示词的文本块。"""
+    lines: list[str] = []
+    if entries:
+        lines.append("可直接调用的插件能力（type=plugin，content 写 插件id:入口id，args 传参）：")
+        for item in entries:
+            args_desc = "，".join(f"{k}={v}" for k, v in (item.get("args") or {}).items())
+            arg_text = f"（参数：{args_desc}）" if args_desc else "（无需参数）"
+            lines.append(f"  * {item['id']} —— {item.get('desc') or '插件能力'}{arg_text}")
+    if installed:
+        lines.append(
+            "本机还安装了这些插件（有专属入口就用上表；没有注册入口的能力不要编造，"
+            "可提示用户用 /插件 查看、/调用 插件id:入口id 手动直调）："
+        )
+        for item in installed:
+            lines.append(f"  - {item['id']}（{item['name']}）：{item.get('description') or '（无描述）'}")
+    return "\n".join(lines)
+
+
+def parse_direct_call_args(rest: str) -> tuple[dict[str, Any], str]:
+    """解析 /调用 的参数部分：支持 JSON 对象或 k=v 键值对。
+
+    返回 ``(args, 提示)``；提示非空表示有需要注意的情况。
+    """
+    rest = (rest or "").strip()
+    if not rest:
+        return {}, ""
+    if rest.startswith("{"):
+        try:
+            data = json.loads(rest)
+        except json.JSONDecodeError:
+            return {}, "JSON 参数解析失败，请检查格式"
+        if isinstance(data, dict):
+            return data, ""
+        return {}, "JSON 参数必须是对象"
+    args: dict[str, Any] = {}
+    ignored: list[str] = []
+    for token in rest.split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                args[key] = value
+        else:
+            ignored.append(token)
+    note = f"（忽略了不带 = 的参数：{'、'.join(ignored)}）" if ignored else ""
+    return args, note
+
+
+def render_entry_list(entries: list[dict[str, Any]]) -> str:
+    """给用户看的可调用能力清单（按插件分组）。"""
+    if not entries:
+        return "暂无注册的插件能力：用 /reloadplugin 重新扫描，或编辑 plugin_links.json 添加喵。"
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in entries:
+        plugin = item["id"].split(":", 1)[0]
+        groups.setdefault(plugin, []).append(item)
+    lines = ["🧩 可直接调用的插件能力："]
+    for plugin in sorted(groups):
+        lines.append(f"▸ {plugin}")
+        for item in groups[plugin]:
+            args_desc = "，".join(f"{k}={v}" for k, v in (item.get("args") or {}).items())
+            arg_text = f"（参数：{args_desc}）" if args_desc else "（无需参数）"
+            lines.append(f"  - {item['id']} —— {item.get('desc') or '插件能力'}{arg_text}")
+    lines.append("直调：/调用 插件id:入口id 参数=值；或直接说人话让 AI 帮你路由喵～")
+    return "\n".join(lines)
+
+
+def render_plugin_list(installed: list[dict[str, Any]]) -> str:
+    """给用户看的已安装插件清单。"""
+    if not installed:
+        return "没扫到其它已安装插件喵（本插件只看与自己平级的目录）。"
+    lines = [f"📦 本机共发现 {len(installed)} 个其它插件："]
+    for item in installed:
+        desc = item.get("description") or ""
+        lines.append(f"- {item['name']}（{item['id']} v{item['version']}）：{desc[:60]}")
+    lines.append("调用能力：/插件 看已注册入口，或 /调用 插件id:入口id 参数=值 直调。")
+    return "\n".join(lines)
+
+
 class CommandRegistry:
     """命令注册表：加载、保存、执行、权限校验。"""
 
@@ -1698,6 +1904,7 @@ def build_match_prompt(
     auto_create: bool,
     default_permission: str,
     default_type: str,
+    capability_text: str = "",
 ) -> str:
     """构造给大模型的命令匹配/创建提示词。
 
@@ -1740,15 +1947,8 @@ def build_match_prompt(
 命令类型说明：
 - reply：文本回复（猫娘口吻）
 - shell：本机命令行
-- plugin：调用其他 N.E.K.O 插件的能力，content 写 "插件id:入口id"，args 是传给它的参数。已知可用的有：
-  * anysearch:search —— 联网搜索，参数 {{"query": "关键词"}}；凡是"查一查/搜一下/最新消息"类需求优先用它
-  * sys_monitor:a_status —— 查看本机 CPU/内存/磁盘/电量状态，无需参数
-  * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
-  * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
-  * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
-  * neko_watch_party:start_watch —— 陪看B站视频（参数 {"video": "链接或BV号", "begin_now": true}）；用户想让你陪着看B站视频时用它
-  * neko_watch_party:jump_to —— 陪看进度校准（参数 {"minute": 当前看到第几分钟}）
-  * neko_watch_party:stop_watch —— 结束陪看并输出总结（无需参数）
+- plugin：调用其他 N.E.K.O 插件的能力，content 写 插件id:入口id，args 是传给它的参数
+{capability_text}
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄命令配置里的 permission）：

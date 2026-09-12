@@ -21,3 +21,5 @@ default_type = "reply"
 llm_timeout = 20
 # shell 查询类命令最长等待时间（秒），超时判定失败；输出超过 4000 字符自动截断
 shell_timeout = 30
+# /调用 直调其它插件能力的权限门槛：user（默认，谁都能直调）/ admin（需先 /su 提权）
+direct_call_permission = "user"
