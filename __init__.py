@@ -22,6 +22,7 @@ import inspect
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -71,6 +72,7 @@ from ._command_logic import (
     format_plugin_result,
     harvest_entries_from_commands,
     is_exit_admin,
+    is_stop_deep_search,
     load_entry_registry,
     load_settings,
     merge_entry_registry,
@@ -86,15 +88,17 @@ from ._command_logic import (
 )
 
 from ._deep_search_logic import (
+    build_candidate_queue,
     build_final_report,
     build_page_prompt,
     build_select_prompt,
+    build_walk_summary,
     cross_check_codes,
     decode_page_body,
     extract_code_candidates,
     html_to_text,
+    page_has_answer,
     parse_page_analysis,
-    parse_search_cards,
     parse_selection,
 )
 
@@ -116,6 +120,8 @@ _HELP_TEXT = (
     "- /<任意自然语言>：AI 先在命令库匹配，命中即执行；未命中会自动学一条新命令\n"
     "- 带参数的命令（如「B站搜索 原神」）：搜索词会自动提取，下次任何关键词都能直接用\n"
     "- 「查一查/搜一下」类需求会调用其它插件的能力（联网搜索/运势/陪看…）\n"
+    "- /深搜 <问题>：搜索 → 排好候选网页 → 逐个翻页核实答案，翻到答案或你说停才停\n"
+    "- 「停止深搜」或「别翻了」：叫停正在进行的深搜，已核实的内容会先报给你\n"
     "- /插件：查看本机插件与可直接调用的能力；/调用 插件id:入口id 参数=值：直调插件能力\n"
     "- /cmdlist：列出全部命令；/findcmd <关键词>：按关键词筛选命令\n"
     "- /delcmd <命令ID>：删除命令（admin 级命令需先提权）\n"
@@ -173,11 +179,18 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.llm_timeout: float = 20.0
         self.shell_timeout: float = 30.0
         self.request_timeout: float = 20.0
+        self.browser_timeout: float = 60.0
         self.direct_call_permission: str = "user"
         self.deep_search_max_pages: int = 4
+        self.deep_search_max_seconds: int = 180
         self.deep_search_progress: bool = True
         self.catgirl_name: str = "猫娘"
         self._config_loaded: bool = False
+
+        # 深搜后台任务（入口立刻返回，翻页在后台跑，可被 /停止深搜 或自然语言叫停）
+        self._deep_task: Optional[asyncio.Task] = None
+        self._deep_stop: Optional[asyncio.Event] = None
+        self._deep_query: str = ""
 
         # 插件互联（v0.4）：能力注册表 + 已安装插件清单 → 注入匹配提示词
         self._entries: list[dict[str, Any]] = []
@@ -221,6 +234,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.llm_timeout = settings["llm_timeout"]
         self.shell_timeout = settings["shell_timeout"]
         self.request_timeout = settings["request_timeout"]
+        self.browser_timeout = settings["browser_timeout"]
 
         self.registry.admin_password = self.admin_password
         self.registry.auto_create = self.auto_create
@@ -229,6 +243,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         self.registry.shell_timeout = self.shell_timeout
         self.direct_call_permission = settings["direct_call_permission"]
         self.deep_search_max_pages = settings["deep_search_max_pages"]
+        self.deep_search_max_seconds = settings["deep_search_max_seconds"]
         self.deep_search_progress = settings["deep_search_progress"]
         self.catgirl_name = settings["catgirl_name"]
         self._config_loaded = True
@@ -254,28 +269,43 @@ class NaturalCommandPlugin(NekoPluginBase):
 
     # ── 插件互联（v0.4）────────────────────────────────────────
     async def _call_entry(self, target: str, args: Optional[dict[str, Any]] = None, timeout: float = 30.0) -> Any:
-        """跨插件调用：兼容本宿主 SDK 的多种 API 形态。
+        """跨插件调用：按宿主 SDK 官方契约探测可用形态。
 
-        当前宿主（SdkContext）实测可用的跨插件入口是
-        ctx.trigger_plugin_event(target_plugin_id=…, event_type="adapter_call",
-                                 event_id=…, params=…, timeout=…)，
-        与官方 mcp_adapter 插件用法一致；它可能返回协程，也可能直接返回结果，
-        这里两种都兼容。ctx.plugins.call_entry / ctx.call_plugin_entry 等旧写法
-        在当前版本并不存在，只作为兼容回退。
-        按优先级探测，成功一种后不再尝试其它形态。
+        官方 SDK（plugin/sdk/shared/core/plugins.py 的 Plugins.call_entry →
+        Plugins.call，以及 plugin/sdk/adapter/base.py 的 AdapterContext.call_plugin）
+        给出的正解是：
+          ctx.call_plugin_entry(target_plugin_id=…, entry_id=…, params=…, timeout=…)
+        或
+          ctx.trigger_plugin_event(…, event_type="plugin_entry", …)
+        即 event_type 必须是 "plugin_entry"。此前照抄 mcp_adapter 用的
+        "adapter_call" 只走适配器路由，普通插件入口收不到，表现就是调用一直挂到超时、
+        目标插件日志里连触发记录都没有。
+        返回可能是协程也可能直接是结果，两种都兼容；按优先级探测，成功一种即返回。
         """
         plugin_id, _, entry_id = target.partition(":")
         args = args or {}
         attempts: list[tuple[str, Any]] = []
         ctx = getattr(self, "ctx", None)
         if ctx is not None:
+            if hasattr(ctx, "call_plugin_entry"):
+                attempts.append(
+                    (
+                        "ctx.call_plugin_entry",
+                        lambda: ctx.call_plugin_entry(
+                            target_plugin_id=plugin_id,
+                            entry_id=entry_id,
+                            params=dict(args),
+                            timeout=float(timeout),
+                        ),
+                    )
+                )
             if hasattr(ctx, "trigger_plugin_event"):
                 attempts.append(
                     (
                         "ctx.trigger_plugin_event",
                         lambda: ctx.trigger_plugin_event(
                             target_plugin_id=plugin_id,
-                            event_type="adapter_call",
+                            event_type="plugin_entry",
                             event_id=entry_id,
                             params=dict(args),
                             timeout=float(timeout),
@@ -285,8 +315,6 @@ class NaturalCommandPlugin(NekoPluginBase):
             plugins = getattr(ctx, "plugins", None)
             if plugins is not None and hasattr(plugins, "call_entry"):
                 attempts.append(("ctx.plugins.call_entry", lambda: plugins.call_entry(target, args)))
-            if hasattr(ctx, "call_plugin_entry"):
-                attempts.append(("ctx.call_plugin_entry", lambda: ctx.call_plugin_entry(plugin_id, entry_id, args, timeout)))
             bus = getattr(ctx, "bus", None)
             if bus is not None and hasattr(bus, "call_plugin_entry"):
                 attempts.append(("ctx.bus.call_plugin_entry", lambda: bus.call_plugin_entry(plugin_id, entry_id, args, timeout)))
@@ -628,6 +656,10 @@ class NaturalCommandPlugin(NekoPluginBase):
         if is_exit_admin(user_input):
             return Ok(self._exit_admin())
 
+        # 叫停出口：正在深搜时，任何语义为“停止/别翻了”的输入都直接叫停（命令 + 自然语言通用）
+        if self._deep_running() and is_stop_deep_search(user_input):
+            return Ok(self._stop_deep_search())
+
         # admin 权限只在带 / 前缀时生效；不带 / 的自然语言一律按 user 级别处理（与 user 同级），
         # 因此提权不会让普通聊天/自然语言获得管理员能力。
         allow_admin = had_prefix
@@ -660,12 +692,14 @@ class NaturalCommandPlugin(NekoPluginBase):
         if builtin in ("深搜", "deepsearch", "deep_search"):
             query = user_input[len(builtin):].strip()
             try:
-                return Ok(await self._run_deep_search(query))
+                return Ok(await self._start_deep_search(query))
             except SdkError as exc:
                 return Err(exc)
             except Exception as exc:
                 self.logger.exception("深搜异常: %s", exc)
                 return Err(SdkError(f"深搜出错了喵：{exc}"))
+        if builtin in ("停止深搜", "stopdeepsearch", "stop_deep_search", "stopsearch"):
+            return Ok(self._stop_deep_search())
 
         # AI 语义匹配或自动创建（威胁审查 risk 与匹配/创建并入同一轮，不额外调用模型）
         try:
@@ -694,12 +728,15 @@ class NaturalCommandPlugin(NekoPluginBase):
         if action == "deep_search":
             query = _safe_str(result.get("query")) or user_input
             try:
-                return Ok(await self._run_deep_search(query))
+                return Ok(await self._start_deep_search(query))
             except SdkError as exc:
                 return Err(exc)
             except Exception as exc:
                 self.logger.exception("深搜异常: %s", exc)
                 return Err(SdkError(f"深搜出错了喵：{exc}"))
+
+        if action == "deep_stop":
+            return Ok(self._stop_deep_search())
 
         new_cmd = extract_new_command(result)
 
@@ -782,9 +819,30 @@ class NaturalCommandPlugin(NekoPluginBase):
 
     # ── 深度搜索代理（v0.5）：搜索 → 筛选 → 进页面 → 核实 → 作答 ──
     async def _deep_fetch_text(self, url: str) -> str:
-        """抓取网页正文；B站视频页走 API 拿简介+热评（HTML 是 JS 渲染的拿不到）。"""
+        """抓取网页正文：**深读卫星真浏览器为主力**，本地静态抓取只作快速兜底。
+
+        用户诉求是"进页面里找答案"，而兑换码公告页/JS 渲染页/反爬页往往静态抓不到正文，
+        所以默认交给深读卫星用真浏览器渲染；只有卫星未装、失败或拿到的正文太短时，
+        才退回本地静态抓取。B站视频页走 API（HTML 是 JS 渲染的拿不到简介+热评）。
+        """
         if "bilibili.com/video/" in url or url.startswith("BV"):
             return await self._bilibili_video_text(url)
+
+        # 1) 主力：深读卫星真浏览器渲染
+        satellite_text = await self._satellite_read(url)
+        if len(satellite_text.strip()) >= 500:
+            return satellite_text
+
+        # 2) 兜底：本地静态抓取（快，但 JS 渲染/反爬页可能只有空壳）
+        text = await self._static_fetch_text(url)
+
+        # 3) 静态也不足、但卫星至少抓到了些内容 → 用卫星的
+        if len(satellite_text.strip()) > len(text.strip()):
+            return satellite_text
+        return text
+
+    async def _static_fetch_text(self, url: str) -> str:
+        """本地静态抓取网页正文（urllib），供卫星不可用时兜底。"""
 
         def _get() -> tuple[int, bytes, str]:
             request = urllib.request.Request(
@@ -803,22 +861,16 @@ class NaturalCommandPlugin(NekoPluginBase):
                 return 0, b"", ""
 
         status, body, ctype = await asyncio.to_thread(_get)
-        text = ""
         if status == 200 and body:
-            text = html_to_text(decode_page_body(body, ctype))
-        if len(text.strip()) >= 500:
-            return text
-        # 静态不足（JS 渲染 / 反爬 403 / 空壳）→ 交给深读卫星用真浏览器渲染
-        satellite_text = await self._satellite_read(url)
-        if len(satellite_text.strip()) > len(text.strip()):
-            return satellite_text
-        return text
+            return html_to_text(decode_page_body(body, ctype))
+        return ""
+
 
     async def _satellite_read(self, url: str) -> str:
         """通过深读卫星插件用真浏览器读取页面（附属插件未装/失败时静默回退）。"""
         try:
             raw = await self._call_entry(
-                "neko_deep_fetch:read_page", {"url": url, "force_browser": True}, timeout=self.request_timeout
+                "neko_deep_fetch:read_page", {"url": url, "force_browser": True}, timeout=self.browser_timeout
             )
         except Exception as exc:
             self.logger.info("[deep_search] 卫星读页不可用: %s", exc)
@@ -830,11 +882,41 @@ class NaturalCommandPlugin(NekoPluginBase):
             return str(report.get("text") or "")
         return ""
 
+    async def _satellite_web_search(self, query: str) -> list[dict[str, Any]]:
+        """通过深读卫星插件**自带的免 Key 搜索**拿候选网页（已按质量打分排序）。
+
+        卫星内部顺序：DuckDuckGo（ddgs 库 / html 端点）→ 真浏览器 Bing 兜底。
+        不再依赖 anysearch 等第三方插件，卫星未装/失败时静默回退为空表。
+        """
+        try:
+            raw = await self._call_entry(
+                "neko_deep_fetch:web_search", {"query": query, "max_results": 10}, timeout=self.browser_timeout
+            )
+        except Exception as exc:
+            self.logger.info("[deep_search] 卫星搜索不可用: %s", exc)
+            return []
+        payload = raw
+        if isinstance(payload, dict) and "result" in payload:
+            payload = payload["result"]
+        if not isinstance(payload, dict):
+            return []
+        cards: list[dict[str, Any]] = []
+        for item in payload.get("results") or []:
+            if isinstance(item, dict) and _safe_str(item.get("url")):
+                cards.append(
+                    {
+                        "title": _safe_str(item.get("title")),
+                        "url": _safe_str(item.get("url")),
+                        "desc": _safe_str(item.get("desc")),
+                    }
+                )
+        return cards
+
     async def _satellite_bing_cards(self, query: str) -> list[dict[str, Any]]:
         """通过深读卫星用真浏览器做 Bing 搜索，返回深搜卡片。"""
         try:
             raw = await self._call_entry(
-                "neko_deep_fetch:bing_search", {"query": query, "max_results": 8}, timeout=self.request_timeout
+                "neko_deep_fetch:bing_search", {"query": query, "max_results": 8}, timeout=self.browser_timeout
             )
         except Exception as exc:
             self.logger.info("[deep_search] 卫星 Bing 不可用: %s", exc)
@@ -981,25 +1063,89 @@ class NaturalCommandPlugin(NekoPluginBase):
             "duration": _safe_int(v.get("duration"), 0),
         }
 
-    async def _run_deep_search(self, query: str, max_pages: Optional[int] = None) -> str:
+    # ── 深搜：后台任务 + 候选队列逐个翻页 ────────────────────────
+    def _deep_running(self) -> bool:
+        return self._deep_task is not None and not self._deep_task.done()
+
+    def _stop_deep_search(self) -> str:
+        """叫停正在跑的深搜：置停止位，worker 在翻下一页前收手。"""
+        if not self._deep_running():
+            return "现在没有在跑的深搜喵，不用停～"
+        if self._deep_stop is not None:
+            self._deep_stop.set()
+        return f"收到喵！本喵这就停下「{self._deep_query}」，把已经核实到的先报给你。"
+
+    async def _start_deep_search(self, query: str, max_pages: Optional[int] = None) -> str:
+        """深搜入口：登记后台任务后立刻返回，翻页交给 _deep_search_worker。
+
+        之所以不在入口里同步跑完：深搜要逐个翻页直到找到答案，可能超过 SDK 的
+        单次调用超时，而且入口一直占着的话用户就没法发指令叫停了。
+        """
         await self._ensure_config_loaded()
         query = _safe_str(query)
         if not query:
             return "想让我深搜什么喵？/深搜 <问题>，比如：/深搜 原神最新直播兑换码"
-        limit = max(1, min(int(max_pages or self.deep_search_max_pages), 6))
+        if self._deep_running():
+            return f"本喵正在深搜「{self._deep_query}」喵，还没翻完呢～要停下说「停止深搜」就行。"
+        limit = max(1, min(int(max_pages or self.deep_search_max_pages), 12))
+        self._deep_stop = asyncio.Event()
+        self._deep_query = query
+        self._deep_task = asyncio.create_task(self._deep_search_worker(query, limit))
+        return (
+            f"🔍 收到喵！本喵这就去搜「{query}」，从最像的结果开始逐个翻页核实，"
+            f"找到就直接报给你（最多翻 {limit} 页 / {self.deep_search_max_seconds} 秒）。"
+            "要中途停下，随时说「停止深搜」喵～"
+        )
 
-        # 1) 搜索：anysearch + B站搜索 双来源（互为备份，合并去重）
-        search_notes: list[str] = []
-        cards: list[dict[str, Any]] = []
+    async def _deep_search_worker(self, query: str, limit: int) -> None:
+        """后台跑完整轮深搜，结束后用 push_message 主动汇报（不阻塞入口）。"""
+        report = ""
         try:
-            raw = await self._call_entry(
-                "anysearch:search", {"query": query, "max_results": 10}, timeout=self.request_timeout
-            )
-            search_text = raw.get("result") if isinstance(raw, dict) else str(raw)
-            cards = parse_search_cards(search_text or "")
+            report = await self._run_deep_search(query, limit, stop_event=self._deep_stop)
         except Exception as exc:
-            self.logger.warning("[deep_search] anysearch 失败: %s", exc)
-            search_notes.append("anysearch 调用失败")
+            self.logger.exception("深搜后台任务异常: %s", exc)
+            report = f"呜…深搜中途出错了喵：{exc}"
+        finally:
+            self._deep_query = ""
+            self._deep_stop = None
+            self._deep_task = None
+        if not report:
+            return
+        try:
+            self.ctx.push_message(
+                source=_PLUGIN_ID,
+                visibility=[],
+                ai_behavior="respond",
+                parts=[{"type": "text", "text": report}],
+                priority=3,
+                metadata={"description": "🐱 深搜结果"},
+            )
+        except Exception:
+            self.logger.warning("[deep_search] 结果推送失败")
+
+    async def _run_deep_search(
+        self,
+        query: str,
+        max_pages: Optional[int] = None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> str:
+        await self._ensure_config_loaded()
+        query = _safe_str(query)
+        if not query:
+            return "想让我深搜什么喵？/深搜 <问题>，比如：/深搜 原神最新直播兑换码"
+        limit = max(1, min(int(max_pages or self.deep_search_max_pages), 12))
+        deadline = time.monotonic() + max(30, int(self.deep_search_max_seconds))
+
+        # 1) 搜索：卫星自带联网搜索（免 Key，DuckDuckGo → 真浏览器 Bing 兜底，已按质量排序）
+        #    + B站搜索（匿名 API，兑换码视频的重要来源）双来源，合并去重
+        search_notes: list[str] = []
+        web_cards: list[dict[str, Any]] = []
+        bili_cards: list[dict[str, Any]] = []
+        try:
+            web_cards = await self._satellite_web_search(query)
+        except Exception as exc:
+            self.logger.warning("[deep_search] 卫星搜索失败: %s", exc)
+            search_notes.append("卫星搜索调用失败")
         try:
             bili_cards = await self._bili_search_cards(query)
         except Exception as exc:
@@ -1009,7 +1155,7 @@ class NaturalCommandPlugin(NekoPluginBase):
         # 合并去重（按 URL），统一重编号——筛选解析按编号回查，必须连续
         seen_urls: set[str] = set()
         merged: list[dict[str, Any]] = []
-        for card in cards + bili_cards:
+        for card in web_cards + bili_cards:
             url = str(card.get("url") or "").rstrip("/")
             if not url or url in seen_urls:
                 continue
@@ -1017,35 +1163,28 @@ class NaturalCommandPlugin(NekoPluginBase):
             merged.append(card)
         cards = [{**card, "index": i} for i, card in enumerate(merged, 1)]
         if not cards:
-            # 常规双源全挂（anysearch 异常 / B站风控）→ 先让卫星用真浏览器 Bing 补一轮
-            try:
-                cards = await self._satellite_bing_cards(query)
-                if cards:
-                    search_notes.append("已切换真浏览器搜索")
-            except Exception as exc:
-                self.logger.warning("[deep_search] 卫星 Bing 补源失败: %s", exc)
-        if not cards:
             note_text = f"（{'；'.join(search_notes)}）" if search_notes else ""
             return (
                 f"呜…搜索这一步就没走通喵{note_text}。"
                 "本喵拿不到结果列表，没法帮你进页面核实。请检查网络后稍后再试。"
             )
 
-        # 2) 筛选：按标题/摘要挑最可能藏答案的页面
+        # 2) 筛选：只用来给候选页面**排序**（不再拿摘要当答案直接收工——
+        #    用户的诉求是"进页面里找，第一个没有就翻第二个"，摘要里的话必须落到页面上核实）
         select_prompt = build_select_prompt(query, cards)
         selected, direct = [], ""
         try:
             select_raw = await self._call_llm_json("你是搜索代理的筛选引擎。", select_prompt)
             selected, direct = parse_selection(select_raw, cards)
         except SdkError as exc:
-            self.logger.warning("[deep_search] 筛选失败: %s", exc)
-            return str(exc)
-        if direct:
-            return f"不用翻页面喵，搜索摘要里就有答案：\n{direct}\n（来源：{cards[0].get('url', '')}）"
-        if not selected:
-            return "搜了一圈，标题和摘要看起来都不对劲喵，本喵没敢乱翻。换个更具体的关键词试试？"
+            self.logger.warning("[deep_search] 筛选失败，改为按搜索顺序逐个翻: %s", exc)
+            selected, direct = [], ""
 
-        # 2.5) 进度反馈：深搜要翻好几个页面，先让猫娘报个幕
+        # 3) 排队：筛选命中的排最前，其余结果按原顺序垫后 → 第一个没有就翻第二个，以此类推
+        queue = build_candidate_queue(selected, cards)
+        planned = min(len(queue), limit)
+
+        # 3.5) 进度反馈：深搜要翻好几页，先让猫娘报个幕
         if self.deep_search_progress:
             try:
                 self.ctx.push_message(
@@ -1053,8 +1192,9 @@ class NaturalCommandPlugin(NekoPluginBase):
                     visibility=[],
                     ai_behavior="respond",
                     parts=[{"type": "text", "text": (
-                        f"🔍 本喵拿到 {len(cards)} 条搜索结果，挑出了 {min(len(selected), limit)} 个最像的页面，"
-                        "现在开始逐个翻页核实喵，大概要等一小会儿…"
+                        f"🔍 本喵拿到 {len(cards)} 条搜索结果，排好 {len(queue)} 个候选页面，"
+                        f"现在开始逐个翻页核实喵（最多翻 {planned} 页 / {self.deep_search_max_seconds} 秒，"
+                        "找到就停，想说停随时喊「停止深搜」）…"
                     )}],
                     priority=3,
                     metadata={"description": "🐱 深搜进行中"},
@@ -1062,58 +1202,112 @@ class NaturalCommandPlugin(NekoPluginBase):
             except Exception:
                 self.logger.warning("[deep_search] 进度推送失败")
 
-        # 3) 逐页抓取 + 分析 + 交叉核对
+        # 4) 逐个翻页：每读一页就检查「找到了吗 / 被叫停了吗 / 到上限了吗」
         analyses: list[dict[str, Any]] = []
-        for card in selected[:limit]:
+        pages_read = 0
+        stop_reason = "exhausted"
+        for card in queue:
+            if pages_read >= planned:
+                stop_reason = "limit"
+                break
+            if time.monotonic() > deadline:
+                stop_reason = "deadline"
+                break
+            if stop_event is not None and stop_event.is_set():
+                stop_reason = "cancelled"
+                break
+
             page_text = await self._deep_fetch_text(card.get("url", ""))
+            pages_read += 1
             if not page_text:
                 analyses.append({"card": card, "analysis": {"relevant": False, "answer": "", "codes": [], "summary": ""}, "verified_codes": []})
-                continue
-            try:
-                analysis = parse_page_analysis(
-                    await self._call_llm_json(
-                        "你是搜索代理的阅读引擎。",
-                        build_page_prompt(query, card, page_text),
+            else:
+                try:
+                    analysis = parse_page_analysis(
+                        await self._call_llm_json(
+                            "你是搜索代理的阅读引擎。",
+                            build_page_prompt(query, card, page_text),
+                        )
                     )
-                )
-            except SdkError as exc:
-                self.logger.warning("[deep_search] 页面分析失败: %s", exc)
-                analysis = {"relevant": False, "answer": "", "codes": [], "summary": f"分析失败：{exc}"}
-            verified = cross_check_codes(analysis.get("codes", []), page_text)
-            analyses.append({"card": card, "analysis": analysis, "verified_codes": verified})
+                except SdkError as exc:
+                    self.logger.warning("[deep_search] 页面分析失败: %s", exc)
+                    analysis = {"relevant": False, "answer": "", "codes": [], "summary": f"分析失败：{exc}"}
+                verified = cross_check_codes(analysis.get("codes", []), page_text)
+                analyses.append({"card": card, "analysis": analysis, "verified_codes": verified})
+                # 找到答案就立刻收工——只有找到 / 被叫停 / 到上限才停
+                if page_has_answer(analysis, verified):
+                    stop_reason = "found"
+                    self.logger.info("[deep_search] 第 %d 页翻到答案，停止翻页", pages_read)
+                    break
+
+            # 这一页没有 → 报个进度，继续翻下一个
+            if self.deep_search_progress and pages_read < planned:
+                label = _safe_str(card.get("title")) or _safe_str(card.get("url"))
+                try:
+                    self.ctx.push_message(
+                        source=_PLUGIN_ID,
+                        visibility=[],
+                        ai_behavior="respond",
+                        parts=[{"type": "text", "text": (
+                            f"🐱 第 {pages_read}/{planned} 页没找到，继续翻下一个：{label[:40]}…"
+                        )}],
+                        priority=2,
+                        metadata={"description": "🐱 深搜翻页中"},
+                    )
+                except Exception:
+                    self.logger.warning("[deep_search] 翻页进度推送失败")
             await asyncio.sleep(0.3)
 
-        # 4) 汇总（本地组装，只引用核实过的内容）
+        # 5) 汇总（本地组装，只引用核实过的内容）+ 翻页小结
         report = build_final_report(query, analyses, self.catgirl_name)
-        self.logger.info("[deep_search] 完成：%s（读了 %d 页）", query, len(analyses))
-        return report
+        parts = [report, build_walk_summary(pages_read, planned, stop_reason)]
+        found_any = any(item.get("verified_codes") for item in analyses)
+        if direct and not found_any and stop_reason in ("exhausted", "limit", "deadline"):
+            parts.append(f"（另外筛选时摘要里似乎提到：{direct}——但本喵没能在页面正文里核实到，仅供参考喵。）")
+        final = "\n".join(p for p in parts if p)
+        self.logger.info(
+            "[deep_search] 完成：%s（翻了 %d/%d 页，停止原因 %s）", query, pages_read, planned, stop_reason
+        )
+        return final
 
     @plugin_entry(
         id="deep_search",
         name="深度搜索",
-        description="搜索代理：搜索 → 按摘要筛选候选网页 → 逐页读取正文 → 交叉核实答案（如兑换码）→ 汇总报告。",
+        description=(
+            "搜索代理：搜索 → 排好候选网页队列 → 逐个翻页读取正文 → 交叉核实答案（如兑换码），"
+            "翻到答案或用户叫停才停。入口立刻返回，翻页在后台跑，结果用消息推送。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "要核实的问题"},
-                "max_pages": {"type": "integer", "description": "最多读几个页面（1-6，默认配置值）"},
+                "max_pages": {"type": "integer", "description": "最多翻几个页面（1-12，默认配置值）"},
             },
             "required": ["query"],
         },
     )
     async def deep_search_entry(self, query: str = "", max_pages: int = 0, **_):
         try:
-            return Ok(await self._run_deep_search(query, max_pages or None))
+            return Ok(await self._start_deep_search(query, max_pages or None))
         except Exception as exc:
             self.logger.exception("深搜失败: %s", exc)
             return Err(SdkError(f"深搜出错了喵：{exc}"))
+
+    @plugin_entry(
+        id="stop_deep_search",
+        name="停止深搜",
+        description="叫停正在进行的深度搜索，把已经核实到的内容先汇报出来。",
+        input_schema={"type": "object", "properties": {}},
+    )
+    async def stop_deep_search_entry(self, **_):
+        return Ok(self._stop_deep_search())
 
     async def _direct_plugin_call(self, rest: str, effective: str):
         """`/调用 插件id:入口id k=v|JSON`：跳过 AI 匹配，直连其它插件的能力。"""
         if not rest:
             return Ok(
                 "用法喵：/调用 插件id:入口id 参数=值 …\n"
-                "例：/调用 anysearch:search query=原神\n"
+                "例：/调用 neko_deep_fetch:web_search query=原神\n"
                 "也支持 JSON：/调用 neko_watch_party:start_watch {\"video\": \"BV...\", \"begin_now\": true}\n"
                 "有哪些能力可用：/插件"
             )

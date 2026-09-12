@@ -124,6 +124,29 @@ def is_exit_admin(text: str) -> bool:
     return _EXIT_ADMIN_RE.search(lowered) is not None
 
 
+# 语义是“叫停正在进行的深搜”的输入（只在深搜真的在跑时才生效）
+_STOP_DEEP_PHRASES = (
+    "停止深搜", "停止搜索", "停止查找", "停止翻页", "停止deepsearch",
+    "stopdeepsearch", "stop deep search", "stop search",
+    "别搜了", "不要搜了", "不用搜了", "别翻了", "不要翻了", "不用翻了",
+    "别找了", "不要找了", "不用找了", "别查了", "中断深搜", "取消深搜",
+)
+_STOP_DEEP_RE = re.compile(
+    r"(停止|终止|中断|取消|停下|暂停|别|不要|不用)\s*(深搜|深度搜索|搜索|搜|翻页|翻|查找|查|找)",
+    re.IGNORECASE,
+)
+
+
+def is_stop_deep_search(text: str) -> bool:
+    """判断输入是否在语义上要求叫停深搜（命令 / 自然语言都算）。"""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered in _STOP_DEEP_PHRASES:
+        return True
+    return _STOP_DEEP_RE.search(lowered) is not None
+
+
 def strip_code_fence(text: str) -> str:
     """去除 markdown 代码块包装。"""
     text = text.strip()
@@ -372,10 +395,15 @@ def load_settings(section: Any) -> dict[str, Any]:
         "shell_timeout": max(1.0, safe_float(section.get("shell_timeout"), 30.0)),
         # 单次网络请求 / 跨插件调用超时（秒），深搜抓取与 B 站接口共用
         "request_timeout": max(1.0, safe_float(section.get("request_timeout"), 20.0)),
+        # 深读卫星（真浏览器）单次调用超时（秒）：浏览器冷启动/渲染远比静态抓取慢，
+        # 用单独的宽裕上限，否则真浏览器搜索/读页会在 20 秒就被掐断（10-300）
+        "browser_timeout": max(10.0, min(safe_float(section.get("browser_timeout"), 60.0), 300.0)),
         # /调用 直调其它插件能力的权限门槛：user（默认）/ admin
         "direct_call_permission": "admin" if safe_str(section.get("direct_call_permission"), "user").lower() == "admin" else "user",
-        # 深搜最多读几个页面（1-6）
-        "deep_search_max_pages": max(1, min(int(safe_float(section.get("deep_search_max_pages"), 4)), 6)),
+        # 深搜最多读几个页面（1-12，逐个翻页的安全上限）
+        "deep_search_max_pages": max(1, min(int(safe_float(section.get("deep_search_max_pages"), 4)), 12)),
+        # 深搜最多跑多少秒（30-900，时间维度的安全上限）
+        "deep_search_max_seconds": max(30, min(int(safe_float(section.get("deep_search_max_seconds"), 180)), 900)),
         # 深搜开始时是否推送进度提示
         "deep_search_progress": safe_bool(section.get("deep_search_progress"), True),
         # 深搜报告署名用的猫娘名字
@@ -1486,7 +1514,6 @@ def format_command_lines(
 # 精选可调用能力（作者自己的插件 + 常用内置）。用户可用 plugin_links.json 增补，
 # AI 创建的 plugin 类型命令也会被自动收割进能力表。
 DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
-    {"id": "anysearch:search", "desc": "联网搜索", "args": {"query": "关键词"}},
     {"id": "sys_monitor:a_status", "desc": "查看本机 CPU/内存/磁盘/电量状态", "args": {}},
     {"id": "neko_daily_fortune:fortune", "desc": "今日运势签/摸鱼指数", "args": {}},
     {"id": "neko_daily_fortune:morning_report", "desc": "早安摸鱼日报（周末/发薪日倒计时+运势速览）", "args": {}},
@@ -1501,6 +1528,8 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_watch_party:jump_to", "desc": "陪看进度校准", "args": {"minute": "当前看到第几分钟"}},
     {"id": "neko_watch_party:react_now", "desc": "针对当前播放位置现场反应", "args": {}},
     {"id": "neko_watch_party:stop_watch", "desc": "结束陪看并总结", "args": {}},
+    {"id": "neko_watch_party:read_comments", "desc": "读当前陪看视频的热评并点评", "args": {}},
+    {"id": "neko_deep_fetch:web_search", "desc": "联网搜索（卫星自带免 Key：DuckDuckGo → 真浏览器 Bing 兜底），返回按质量排序的候选网页", "args": {"query": "搜索词", "max_results": "可选，默认 8"}},
     {"id": "neko_deep_fetch:read_page", "desc": "深读网页（真浏览器渲染，可读 JS 页/反爬页）", "args": {"url": "网页地址", "force_browser": "可选 true 跳过静态"}},
     {"id": "neko_deep_fetch:bing_search", "desc": "真浏览器 Bing 搜索，返回结果列表", "args": {"query": "搜索词"}},
 ]
@@ -1995,6 +2024,7 @@ def build_match_prompt(
 
 【意图分流——最高优先级，先判断再匹配】
 - 用户想要"答案/情报/最新消息/兑换码/帮忙找到并核实某事" → 一律选第 5 条 action=deep_search（深搜会替用户翻网页核实并给答案）。【即使命令库里存在 web_search / bilibili_search 这类命令也不要选它们】——它们只会打开浏览器搜索页，不会产生任何答案。
+- 用户想"叫停正在进行的深搜"（如"停止深搜/别搜了/别翻了/停下来/中断"） → 选第 6 条 action=deep_stop。【不要当成新命令去创建】
 - 只有用户明确想"亲眼看搜索结果/打开浏览器搜"（如"帮我打开浏览器搜原神"）→ 才执行 web_search / bilibili_search。
 - 其余情况按下面 1-4 匹配/创建。
 
@@ -2031,6 +2061,9 @@ def build_match_prompt(
 
 5. 如果是需要**进网页核实**的需求（找最新兑换码/限时情报/必须打开页面才能确认的内容）——按顶部意图分流，这类需求的优先级高于执行任何"打开搜索页"命令：
 {{"action": "deep_search", "query": "改写成适合搜索的问句"}}
+
+6. 如果用户要**叫停正在进行的深搜**（说"停止/别搜了/别翻了"之类）：
+{{"action": "deep_stop"}}
 
 命令类型说明：
 - reply：文本回复（猫娘口吻）
