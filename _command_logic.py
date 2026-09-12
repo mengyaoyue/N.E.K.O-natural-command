@@ -190,6 +190,9 @@ def build_create_prompt(
   * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
   * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
   * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
+  * neko_watch_party:start_watch —— 陪看B站视频（参数 {"video": "链接或BV号", "begin_now": true}）；用户想让你陪着看B站视频时用它
+  * neko_watch_party:jump_to —— 陪看进度校准（参数 {"minute": 当前看到第几分钟}）
+  * neko_watch_party:stop_watch —— 结束陪看并输出总结（无需参数）
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄）：
@@ -1743,6 +1746,9 @@ def build_match_prompt(
   * neko_daily_fortune:fortune —— 今日运势签/摸鱼指数（"今日运势""今天运气怎么样"用它，无需参数）
   * neko_daily_fortune:morning_report —— 早安摸鱼日报（周末/发薪日倒计时+运势速览，无需参数）
   * neko_clipboard_watcher:clipboard_now —— 读取并点评剪贴板内容（"看看我的剪贴板"用它，无需参数）
+  * neko_watch_party:start_watch —— 陪看B站视频（参数 {"video": "链接或BV号", "begin_now": true}）；用户想让你陪着看B站视频时用它
+  * neko_watch_party:jump_to —— 陪看进度校准（参数 {"minute": 当前看到第几分钟}）
+  * neko_watch_party:stop_watch —— 结束陪看并输出总结（无需参数）
   不确定的插件能力不要编造入口，改用 shell 或 reply。
 
 risk 是你对该命令威胁等级的独立审查结果（必须自己判断，不要照抄命令配置里的 permission）：
