@@ -31,12 +31,11 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
         "content": "notepad",
     },
     # 参数化示例：{query} 在执行时由 AI 从用户输入提取填充。
-    # 注意定位：这两条只是"打开浏览器看搜索页"，**不产生答案**；
-    # 需要答案的问题（兑换码/情报/核对类）应走 deep_search 深搜动作。
+    # 注意定位：这两条只是"打开浏览器看搜索页"，**不产生答案**。
     "web_search": {
         "id": "web_search",
         "name": "浏览器打开搜索页",
-        "description": "在浏览器里打开搜索页让用户亲眼看结果（不产生答案；要答案请用深搜）",
+        "description": "在浏览器里打开搜索页让用户亲眼看结果（只打开搜索页，不产生答案）",
         "risk": "harmless",
         "permission": "user",
         "type": "shell",
@@ -46,7 +45,7 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
     "bilibili_search": {
         "id": "bilibili_search",
         "name": "浏览器打开B站搜索",
-        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（不产生答案；要答案请用深搜）",
+        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（只打开搜索页，不产生答案）",
         "risk": "harmless",
         "permission": "user",
         "type": "shell",
@@ -56,15 +55,15 @@ DEFAULT_COMMANDS: dict[str, dict[str, Any]] = {
 }
 
 
-# 内置示例命令的最新文案（v0.5 起明确"打开搜索页≠给答案"）
+# 内置示例命令的最新文案（明确"打开搜索页≠给答案"）
 BUILTIN_EXAMPLE_META = {
     "web_search": {
         "name": "浏览器打开搜索页",
-        "description": "在浏览器里打开搜索页让用户亲眼看结果（不产生答案；要答案请让AI深搜）",
+        "description": "在浏览器里打开搜索页让用户亲眼看结果（只打开搜索页，不产生答案）",
     },
     "bilibili_search": {
         "name": "浏览器打开B站搜索",
-        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（不产生答案；要答案请让AI深搜）",
+        "description": "在浏览器里打开B站搜索页让用户亲眼看结果（只打开搜索页，不产生答案）",
     },
 }
 _BUILTIN_EXAMPLE_CONTENTS = {
@@ -264,6 +263,8 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 - 【重要】严禁编造不存在的协议（例如 bilibili://、qq://、weixin:// 一律不许出现）
 - 打开网页必须写成：start "" https://具体网址（必须带 https://）
 - 打开软件优先使用系统自带命令（notepad、calc、mspaint、explorer 等）；其他软件写成 start "" "软件名"，系统会自动在本机查找真实程序
+- 关闭 / 结束软件：写成 taskkill /F /IM "软件名.exe"（或 powershell -Command "Stop-Process -Name '软件名' -Force"），**只写软件名即可，不要自己猜进程名**——系统会在本机实际运行的进程里自动匹配真实进程名（例如你写 bilibili，本机进程其实叫哔哩哔哩，也能对上）
+- 【严禁】用 start / 打开命令去“关闭”软件（start 只会再打开一个，不会关闭）
 - 【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径——路径不存在时命令会无声失败
 - 不要写 cmd /c 前缀，直接写 start
 - 不确定真实路径时，宁可只写软件名，也不要编造协议或路径
@@ -406,6 +407,8 @@ def load_settings(section: Any) -> dict[str, Any]:
         "deep_search_max_seconds": max(30, min(int(safe_float(section.get("deep_search_max_seconds"), 180)), 900)),
         # 深搜开始时是否推送进度提示
         "deep_search_progress": safe_bool(section.get("deep_search_progress"), True),
+        # 深搜总开关：默认关闭（代码保留，需要时在配置里打开）
+        "deep_search_enabled": safe_bool(section.get("deep_search_enabled"), False),
         # 深搜报告署名用的猫娘名字
         "catgirl_name": safe_str(section.get("catgirl_name"), "猫娘") or "猫娘",
     }
@@ -517,6 +520,39 @@ _SOURCE_START_MENU = 1
 _SOURCE_APP_PATH = 2
 _SOURCE_UNINSTALL = 3
 _SOURCE_INSTALL_DIR = 4
+
+# ── 关闭进程（结束应用）相关 ────────────────────────────────────────────────
+# 一条 shell 命令里出现这些关键字，说明它在“结束进程”而不是“打开应用”。
+# 关闭类命令必须走“运行时解析真实进程名”的路径，否则 AI 写的英文名
+# （bilibili）与真实进程名（哔哩哔哩）对不上，会无声失败。
+_KILL_CONTENT_RE = re.compile(
+    r"stop-process|taskkill|terminateprocess|\bkill\b",
+    re.IGNORECASE,
+)
+
+# 从关闭类命令里提取目标名的正则（PowerShell Stop-Process / cmd taskkill 两种写法）。
+_KILL_TARGET_PATTERNS = (
+    re.compile(r"-Name\s+['\"]([^'\"]+)['\"]", re.IGNORECASE),
+    re.compile(r"-Name\s+([^\s'\"]+)", re.IGNORECASE),
+    re.compile(r"/IM\s+['\"]?([^'\"\s]+)['\"]?", re.IGNORECASE),
+    re.compile(r"Get-Process\s+['\"]?([^'\"\s|;]+)['\"]?", re.IGNORECASE),
+    re.compile(r"Stop-Process\s+['\"]?([^'\"\s|;-]+)['\"]?", re.IGNORECASE),
+)
+
+# 关闭类命令名 / 描述里需要剔除的修饰词（在“打开”停用词基础上补充关闭相关词）。
+_CLOSE_STOPWORDS = _SHORTCUT_STOPWORDS + (
+    "关闭", "关掉", "关一下", "退出", "结束", "杀掉", "干掉", "杀死", "进程", "任务",
+)
+
+# exe 路径里这些目录段太通用，不能拿来当应用名匹配（否则 “Program Files” 会命中一堆进程）。
+_GENERIC_PATH_TOKENS = {
+    "program files", "program files (x86)", "windows",
+    "system32", "syswow64", "systemapps", "appdata", "local", "locallow",
+    "roaming", "programs", "common files", "bin", "lib", "libs", "usr", "opt",
+    "temp", "tmp", "cache", "caches", "x64", "x86", "x86_64", "amd64",
+    "resources", "resource", "app", "apps", "core", "windowsapps", "current",
+    "versions", "dist", "release", "build", "update", "updates", "binaries",
+}
 
 # 占位 / 空壳 reply 命令的特征话术：AI 当时没能真的完成任务，只存下一句
 # “请提供… / 我找不到… / 抱歉…”的推脱回复，属于典型的垃圾脏数据。
@@ -693,14 +729,45 @@ def _compact(text: str) -> str:
     return _COMPACT_STRIP_RE.sub("", (text or "").lower())
 
 
-def _match_key(name: str, candidates: list[str]) -> Optional[tuple[int, int]]:
+_SUBSTRING_MIN_LEN = 1
+_STRICT_SUBSTRING_MIN_LEN = 4
+
+
+def _loose_substring_hit(left: str, right: str, strict: bool = False) -> bool:
+    """判断两个名字是否存在可信的“包含”关系（任一方是另一方的子串）。
+
+    - 宽松模式（打开应用）：只要较短串非空且被较长串包含就算命中，保留“只打一部分
+      名字也能找到”的能力——打开错了顶多是再关掉，代价小。
+    - 严格模式（关闭进程）：较短串必须 ≥ ``_STRICT_SUBSTRING_MIN_LEN`` 且至少占到
+      较长串的一半，避免 ``neko`` 这类短名捕风捉影，误命中 ``neko_ghost_proc``
+      等无关目标而关错软件（关错软件是不可逆的，宁可报“没找到”）。
+    """
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    min_len = _STRICT_SUBSTRING_MIN_LEN if strict else _SUBSTRING_MIN_LEN
+    if len(shorter) < min_len:
+        return False
+    if shorter not in longer:
+        return False
+    if strict and len(shorter) * 2 < len(longer):
+        return False
+    return True
+
+
+def _match_key(
+    name: str, candidates: list[str], strict: bool = False
+) -> Optional[tuple[int, int]]:
     """给候选词与某个应用名的匹配打分；不匹配返回 ``None``。
 
     返回 ``(是否完全相等, 名称长度)``，越小越优先；命中卸载/帮助类名称直接跳过，
     以免把“卸载哔哩哔哩”当成“哔哩哔哩”。
 
-    匹配同时看两种形态：原始小写（宽松包含）与去掉空格/标点后的紧凑串，
-    后者用于兜住“用户漏打空格 / 大小写 / 分隔符不一致”的情况。
+    匹配同时看两种形态：原始小写与去掉空格/标点后的紧凑串，后者用于兜住
+    “用户漏打空格 / 大小写 / 分隔符不一致”的情况。``strict=True`` 时收紧部分命中，
+    供“关闭进程”这类一旦误判就会关错软件的场景使用。
     """
     stem = _display_stem(name)
     low = stem.lower()
@@ -716,9 +783,12 @@ def _match_key(name: str, candidates: list[str]) -> Optional[tuple[int, int]]:
             continue
         c_compact = _compact(c)
         exact = low == c or (len(c_compact) >= 2 and c_compact == compact)
-        hit = exact or c in low or low in c
-        if not hit and len(c_compact) >= 2 and compact:
-            hit = c_compact in compact or compact in c_compact
+        if exact:
+            hit = True
+        else:
+            hit = _loose_substring_hit(low, c, strict)
+            if not hit and len(c_compact) >= 2 and compact:
+                hit = _loose_substring_hit(compact, c_compact, strict)
         if not hit:
             continue
         key = (0 if exact else 1, len(stem))
@@ -1196,6 +1266,168 @@ def _resolve_index(shortcuts, app_paths, app_index) -> AppIndex:
     return get_default_index()
 
 
+def iter_running_processes(timeout: float = 15.0):
+    """枚举本机正在运行、且能拿到可执行路径的进程，产出 ``(进程名, exe 路径)``。
+
+    与 ``AppIndex`` 同样是“运行时采集、不写死任何应用”：读的是**当前这台机器**
+    上真实在跑的进程，因此每个用户得到的都是自己的进程清单（别人装了什么就有什么）。
+    拿不到 ``Path`` 的受保护进程会被跳过（它们不可能是用户想关的普通应用）。
+    """
+    if os.name != "nt":
+        return
+    script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "Get-Process | Where-Object { $_.Path } | "
+        "Select-Object ProcessName,Path | ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0 or not proc.stdout:
+        return
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = safe_str(item.get("ProcessName"))
+        path = safe_str(item.get("Path"))
+        if name:
+            yield name, path
+
+
+def _path_alias_tokens(exe_path: str) -> list[str]:
+    """从 exe 路径里提取“像应用名”的目录段，作为匹配别名（过滤通用目录）。
+
+    例：``C:\\Program Files\\bilibili\\哔哩哔哩.exe`` → ``["bilibili"]``。
+    正是靠这段目录名，AI 写的英文名 ``bilibili`` 才能命中真实进程名 ``哔哩哔哩``。
+    """
+    text = (exe_path or "").strip()
+    if not text:
+        return []
+    try:
+        parts = Path(text).parts
+    except Exception:
+        return []
+    tokens: list[str] = []
+    for part in parts[1:-1]:
+        token = (part or "").strip()
+        low = token.lower()
+        if not token or low in _GENERIC_PATH_TOKENS:
+            continue
+        if len(_compact(token)) < 3:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def _iter_process_entries(processes):
+    """把 ``(进程名, exe 路径)`` 摊平成 ``(别名, 真实进程名)`` 条目。
+
+    每个进程会生成多个别名：进程名本身、exe 文件名（去后缀）、exe 所在目录名。
+    这样无论 AI 写中文名、英文名还是拼音名，都有机会命中。
+    """
+    for proc_name, exe_path in processes:
+        name = (proc_name or "").strip()
+        if not name:
+            continue
+        yield name, name
+        path = (exe_path or "").strip()
+        if not path:
+            continue
+        stem = Path(path).stem
+        if stem and stem.lower() != name.lower():
+            yield stem, name
+        for token in _path_alias_tokens(path):
+            if token and token.lower() != name.lower():
+                yield token, name
+
+
+class ProcessIndex:
+    """运行中进程索引：把 AI 写的英文 / 拼音 / 中文名映射到**真实进程名**。
+
+    设计目标（解决“不同用户软件不一样”的问题）：与 ``AppIndex`` 一致——
+    代码里不写死任何应用，索引在运行时从操作系统采集，每个用户得到的都是
+    自己机器上的进程清单；结果缓存，避免每条命令都重新枚举。
+
+    “打开”靠 ``AppIndex``（显示名 → 启动目标），“关闭”靠本类
+    （别名 → 真实进程名），两者互补。
+    """
+
+    def __init__(self, collector=None):
+        self._entries: Optional[list[tuple[str, str]]] = None
+        self._collector = collector
+
+    @classmethod
+    def from_processes(cls, processes) -> "ProcessIndex":
+        """用显式的 ``[(进程名, exe 路径), ...]`` 构造（测试 / 复用）。"""
+        index = cls()
+        index._entries = list(_iter_process_entries(processes))
+        return index
+
+    def entries(self) -> list[tuple[str, str]]:
+        if self._entries is None:
+            collector = self._collector or iter_running_processes
+            try:
+                self._entries = list(_iter_process_entries(collector()))
+            except Exception:
+                self._entries = []
+        return self._entries
+
+    def find_names(self, candidates: list[str]) -> list[str]:
+        """返回与候选词匹配的真实进程名列表（去重、保序）。
+
+        - 只要存在“完全命中”的进程，就只返回完全命中的那些，
+          避免 ``bilibili`` 顺带把 ``bilibiliHelper`` 之类一起关掉；
+        - 没有完全命中时才退回部分命中，且用 ``strict`` 收紧，避免短名误伤
+          （参见 ``_loose_substring_hit``）：宁可报“没找到”，也不关错软件。
+        """
+        matches: dict[str, tuple[int, int]] = {}
+        for alias, proc_name in self.entries():
+            key = _match_key(alias, candidates, strict=True)
+            if key is None:
+                continue
+            prev = matches.get(proc_name)
+            if prev is None or key < prev:
+                matches[proc_name] = key
+        if not matches:
+            return []
+        if any(key[0] == 0 for key in matches.values()):
+            return [name for name, key in matches.items() if key[0] == 0]
+        return list(matches)
+
+
+_DEFAULT_PROCESS_INDEX: Optional[ProcessIndex] = None
+
+
+def get_default_process_index() -> ProcessIndex:
+    """获取（并缓存）本机的运行中进程索引。"""
+    global _DEFAULT_PROCESS_INDEX
+    if _DEFAULT_PROCESS_INDEX is None:
+        _DEFAULT_PROCESS_INDEX = ProcessIndex()
+    return _DEFAULT_PROCESS_INDEX
+
+
+def reset_default_process_index() -> None:
+    """清空默认进程索引缓存（想重新枚举本机进程时调用）。"""
+    global _DEFAULT_PROCESS_INDEX
+    _DEFAULT_PROCESS_INDEX = None
+
+
 def _looks_like_domain(token: str) -> bool:
     """判断一个无协议 token 是否是应当补全 https:// 的网址域名。
 
@@ -1395,6 +1627,83 @@ def is_launch_command(command: str) -> bool:
     return False
 
 
+def is_kill_command(command: str) -> bool:
+    """判断一条 shell 命令是否在“结束进程”（关闭应用）。
+
+    只看命令内容里的杀进程关键字（``Stop-Process`` / ``taskkill`` / ``kill``），
+    与具体应用无关——因此对任何软件都成立，不写死任何名字。
+    """
+    return bool(_KILL_CONTENT_RE.search(command or ""))
+
+
+def _clean_process_token(raw: str) -> str:
+    """清洗从命令里抠出来的进程名：去引号、去通配符与 ``.exe`` 后缀。"""
+    token = (raw or "").strip().strip("'\"").strip()
+    if token.lower().endswith(".exe"):
+        token = token[:-4]
+    return token.strip().strip("*").strip()
+
+
+def _strip_close_stopwords(text: str) -> str:
+    result = text or ""
+    for word in _CLOSE_STOPWORDS:
+        result = result.replace(word, "")
+    return result.strip()
+
+
+def _kill_target_candidates(content: str, hint: str = "") -> list[str]:
+    """从一条“关闭进程”命令里提取要关闭的目标名候选。
+
+    两个来源互补：命令内容里的 ``-Name xxx`` / ``/IM xxx.exe``；以及命令名 /
+    描述去掉“关闭 / 结束 / 客户端 / 进程”等修饰词后剩下的名字。
+    """
+    candidates: list[str] = []
+    text = content or ""
+    for pattern in _KILL_TARGET_PATTERNS:
+        for raw in pattern.findall(text):
+            token = _clean_process_token(raw)
+            if token and token not in candidates:
+                candidates.append(token)
+    for chunk in re.split(r"[\s，,、/\\|]+", hint or ""):
+        token = _strip_close_stopwords(chunk)
+        if token and token not in candidates:
+            candidates.append(token)
+    return candidates
+
+
+def resolve_kill_targets(
+    content: str,
+    hint: str = "",
+    process_index: Optional["ProcessIndex"] = None,
+) -> Optional[list[str]]:
+    """为一条“关闭进程”命令找出本机真实在跑的进程名。
+
+    返回值有三种含义，调用方据此决定放行还是报失败（绝不假成功）：
+    - ``None``：这条命令不是关闭类，交给普通解析流程处理；
+    - ``[]``：是关闭类，但本机现在没有匹配的进程（本来没开 / 名字对不上）；
+    - ``[...]``：命中的真实进程名，可直接用来结束进程。
+    """
+    if not is_kill_command(content):
+        return None
+    candidates = _kill_target_candidates(content, hint)
+    if not candidates:
+        return []
+    index = process_index if process_index is not None else get_default_process_index()
+    return index.find_names(candidates)
+
+
+def build_kill_command(process_names: list[str]) -> str:
+    """用真实进程名拼一条可靠的结束命令（taskkill 为系统自带，无需额外依赖）。"""
+    parts: list[str] = []
+    for name in process_names:
+        name = (name or "").strip()
+        if not name:
+            continue
+        image = name if name.lower().endswith(".exe") else f"{name}.exe"
+        parts.append(f'taskkill /F /IM "{image}"')
+    return " & ".join(parts)
+
+
 def _decode_shell_output(data: Any) -> str:
     """把子进程输出的字节按本机编码解码，尽量还原可读文本。"""
     if not data:
@@ -1521,6 +1830,8 @@ DEFAULT_ENTRY_REGISTRY: list[dict[str, Any]] = [
     {"id": "neko_daily_fortune:daily_wife", "desc": "抽今日老婆（图片卡+计数+银金币奖励）", "args": {"user_id": "可选", "user_name": "可选"}},
     {"id": "neko_daily_fortune:fortune_card", "desc": "生成签文式运势卡图片（每天不同）", "args": {"user_id": "可选"}},
     {"id": "neko_daily_fortune:luck_rank", "desc": "幸运排行榜（累计幸运分）", "args": {}},
+    {"id": "neko_daily_fortune:daily_art", "desc": "随机涩图（全年龄泳装/内衣动漫图）", "args": {}},
+    {"id": "neko_daily_fortune:daily_news", "desc": "今日热点新闻（60s API）", "args": {}},
     {"id": "neko_daily_fortune:open_platform", "desc": "在浏览器打开每日关怀平台网页（运势卡/老婆卡/排行）", "args": {}},
     {"id": "neko_clipboard_watcher:clipboard_now", "desc": "读取并点评剪贴板内容", "args": {}},
     {"id": "neko_clipboard_watcher:set_enabled", "desc": "开关剪贴板监听", "args": {"enabled": "true/false"}},
@@ -1742,6 +2053,7 @@ class CommandRegistry:
         default_permission: str = "user",
         default_type: str = "reply",
         app_index: Optional["AppIndex"] = None,
+        process_index: Optional["ProcessIndex"] = None,
         shell_timeout: float = _SHELL_OUTPUT_TIMEOUT,
     ):
         self.commands_path = Path(commands_path)
@@ -1751,6 +2063,7 @@ class CommandRegistry:
         self.default_permission = default_permission
         self.default_type = default_type
         self.app_index = app_index
+        self.process_index = process_index
         self.shell_timeout = max(1.0, float(shell_timeout))
         self.commands: dict[str, dict[str, Any]] = {}
         self._load()
@@ -1955,6 +2268,44 @@ class CommandRegistry:
 
         if cmd_type == "shell":
             hint = f"{cmd.get('name', '')} {cmd.get('description', '')}".strip()
+
+            # 关闭进程类命令：运行时把 AI 写的英文 / 拼音名解析成**本机真实进程名**，
+            # 解析不到就明确报失败——绝不出现“命令跑了但什么都没发生”的假成功。
+            if is_kill_command(content):
+                target_desc = hint or content
+                names = resolve_kill_targets(
+                    content, hint=hint, process_index=self.process_index
+                )
+                if not names:
+                    return {
+                        "success": False,
+                        "output": (
+                            f"命令未执行：这台电脑上现在没有找到正在运行的「{target_desc}」。"
+                            "它可能本来就没打开，或者名字对不上。"
+                            "确定真的关闭成功之前，我不会说已经关掉了喵。"
+                        ),
+                    }
+                kill_cmd = build_kill_command(names)
+                try:
+                    completed = subprocess.run(
+                        kill_cmd,
+                        shell=True,
+                        capture_output=True,
+                        timeout=self.shell_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    return {
+                        "success": False,
+                        "output": f"喵呜…关闭「{target_desc}」等太久了，先放弃了喵。",
+                    }
+                except Exception as exc:
+                    return {"success": False, "output": f"呜…关闭「{target_desc}」时出错了：{exc}"}
+                if completed.returncode != 0:
+                    detail = _decode_shell_output(completed.stderr).strip() or f"退出码 {completed.returncode}"
+                    return {"success": False, "output": f"关闭「{target_desc}」失败了喵：{detail}"}
+                shown = "、".join(names)
+                return {"success": True, "output": f"已经帮你关掉「{shown}」了喵～"}
+
             resolved = resolve_shell_target(content, hint=hint, app_index=self.app_index)
             if content and resolved == "":
                 target_desc = hint or content
@@ -2018,21 +2369,35 @@ def build_match_prompt(
     default_permission: str,
     default_type: str,
     capability_text: str = "",
+    deep_search_enabled: bool = False,
 ) -> str:
     """构造给大模型的命令匹配/创建提示词。
 
     同时要求模型对匹配到的命令做**独立威胁复审**（risk），用于“自动重审降级”：
     一条原本记成 admin 的无害命令，会被 AI 复审为 harmless 并降为 user。
+    深搜默认关闭（deep_search_enabled=False），关闭时不向模型暴露 deep_search 动作。
     """
+    if deep_search_enabled:
+        intent_block = (
+            "【意图分流——最高优先级，先判断再匹配】\n"
+            "- 用户想要\"答案/情报/最新消息/兑换码/帮忙找到并核实某事\" → 一律选第 5 条 action=deep_search（深搜会替用户翻网页核实并给答案）。【即使命令库里存在 web_search / bilibili_search 这类命令也不要选它们】——它们只会打开浏览器搜索页，不会产生任何答案。\n"
+            "- 用户想\"叫停正在进行的深搜\"（如\"停止深搜/别搜了/别翻了/停下来/中断\"） → 选第 6 条 action=deep_stop。【不要当成新命令去创建】\n"
+            "- 只有用户明确想\"亲眼看搜索结果/打开浏览器搜\"（如\"帮我打开浏览器搜原神\"）→ 才执行 web_search / bilibili_search。\n"
+            "- 其余情况按下面 1-4 匹配/创建。\n\n"
+        )
+        extra_items = (
+            "5. 如果是需要**进网页核实**的需求（找最新兑换码/限时情报/必须打开页面才能确认的内容）——按顶部意图分流，这类需求的优先级高于执行任何\"打开搜索页\"命令：\n"
+            "{{\"action\": \"deep_search\", \"query\": \"改写成适合搜索的问句\"}}\n\n"
+            "6. 如果用户要**叫停正在进行的深搜**（说\"停止/别搜了/别翻了\"之类）：\n"
+            "{{\"action\": \"deep_stop\"}}\n\n"
+        )
+    else:
+        intent_block = ""
+        extra_items = ""
+
     return f"""你是自然语言命令路由引擎，同时负责安全审查。你的主人是一只猫娘，说话要带猫娘口吻（句尾加"喵"，简短可爱）。
 
-【意图分流——最高优先级，先判断再匹配】
-- 用户想要"答案/情报/最新消息/兑换码/帮忙找到并核实某事" → 一律选第 5 条 action=deep_search（深搜会替用户翻网页核实并给答案）。【即使命令库里存在 web_search / bilibili_search 这类命令也不要选它们】——它们只会打开浏览器搜索页，不会产生任何答案。
-- 用户想"叫停正在进行的深搜"（如"停止深搜/别搜了/别翻了/停下来/中断"） → 选第 6 条 action=deep_stop。【不要当成新命令去创建】
-- 只有用户明确想"亲眼看搜索结果/打开浏览器搜"（如"帮我打开浏览器搜原神"）→ 才执行 web_search / bilibili_search。
-- 其余情况按下面 1-4 匹配/创建。
-
-已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分；content 里 {{xxx}} 是参数占位符）：
+{intent_block}已有命令列表（可能已经过本地预筛，只展示与输入最相关的一部分；content 里 {{xxx}} 是参数占位符）：
 {json.dumps(commands, ensure_ascii=False, indent=2)}
 
 用户输入：{user_input}
@@ -2063,13 +2428,7 @@ def build_match_prompt(
 4. 如果未匹配到且不允许创建：
 {{"action": "not_found"}}
 
-5. 如果是需要**进网页核实**的需求（找最新兑换码/限时情报/必须打开页面才能确认的内容）——按顶部意图分流，这类需求的优先级高于执行任何"打开搜索页"命令：
-{{"action": "deep_search", "query": "改写成适合搜索的问句"}}
-
-6. 如果用户要**叫停正在进行的深搜**（说"停止/别搜了/别翻了"之类）：
-{{"action": "deep_stop"}}
-
-命令类型说明：
+{extra_items}命令类型说明：
 - reply：文本回复（猫娘口吻）
 - shell：本机命令行
 - plugin：调用其他 N.E.K.O 插件的能力，content 写 插件id:入口id，args 是传给它的参数
@@ -2088,6 +2447,7 @@ risk 是你对该命令威胁等级的独立审查结果（必须自己判断，
 - content 不要有多余解释，reply 就是发给用户的猫娘口吻文本，shell 就是完整命令行
 - 【重要】shell 命令严禁编造 xxx:// 协议；打开网页用 start "" https://具体网址（必须带 https://）
 - 打开软件写 start "" "软件名"，系统会自动在本机查找真实程序；【严禁】自己编造 C:\\...\\xx.exe 或 .lnk 完整路径，路径不存在时会无声失败
+- 关闭 / 结束软件写 taskkill /F /IM "软件名.exe"（或 powershell -Command "Stop-Process -Name '软件名' -Force"），**只写软件名，不要自己猜进程名**——系统会在本机实际运行的进程里自动匹配真实进程名（例如写 bilibili，本机进程其实叫哔哩哔哩也能对上）；【严禁】用 start 去“关闭”软件
 - 不要写 cmd /c 前缀，直接写 start；查询类需求优先 plugin 类型（联网搜索等），其次完整命令行（如 powershell -Command "Get-Date"）
 - 用户想"打开某网站做某事"（如"B站搜索原神"）时，把搜索词做成 {{占位符}} 参数并本次填好 args，这样下次任何关键词都能复用
 """

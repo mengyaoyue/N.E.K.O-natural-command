@@ -21,13 +21,9 @@ default_type = "reply"
 llm_timeout = 20
 # shell 查询类命令最长等待时间（秒），超时判定失败；输出超过 4000 字符自动截断
 shell_timeout = 30
-# 深读卫星（真浏览器）单次调用超时（秒），10-300；浏览器冷启动/渲染慢，单独放宽
+# 浏览器类跨插件调用单次超时（秒），10-300；浏览器冷启动/渲染慢，单独放宽
 browser_timeout = 60
 # /调用 直调其它插件能力的权限门槛：user（默认，谁都能直调）/ admin（需先 /su 提权）
 direct_call_permission = "user"
-# 深搜最多翻几个页面（1-12，逐个翻页的安全上限）
-deep_search_max_pages = 4
-# 深搜最多跑多少秒（30-900，时间维度的安全上限）
-deep_search_max_seconds = 180
-# 深搜开始时是否推送进度提示
-deep_search_progress = true
+# 深度搜索总开关，默认关闭；需要时改成 true 才启用（代码保留，默认不向 AI 暴露）
+deep_search_enabled = false
